@@ -1,0 +1,10 @@
+^E:\PERSONAL PROGECTS\WOW LOG ANALYSER\EXTERNAL\GLFW-3.4\BUILD\CMAKEFILES\63B408168B8EFD898C454B1CA6EBEFB6\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" "-SE:/personal progects/wow log analyser/external/glfw-3.4" "-BE:/personal progects/wow log analyser/external/glfw-3.4/build" --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file "E:/personal progects/wow log analyser/external/glfw-3.4/build/GLFW.sln"
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
