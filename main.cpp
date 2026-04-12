@@ -19,6 +19,8 @@
     #include <limits.h>
 #endif
 
+#include "specData.h"
+
 #include "external/imgui-1.92.7/imgui.h"
 #include "external/imgui-1.92.7/backends/imgui_impl_glfw.h"
 #include "external/imgui-1.92.7/backends/imgui_impl_opengl3.h"
@@ -230,6 +232,7 @@ static std::mutex            g_reportMutex;
 static std::atomic<bool>     g_reportReady{ false };
 
 int main(){
+    static AllSpecs masterSpecList;
     static std::string tokenResponse;
     static bool tokenFetched = false;
     static char wclUrlBuf[512] = "";
