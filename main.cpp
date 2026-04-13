@@ -1,5 +1,3 @@
-// TODO alot of stuff
-
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -28,6 +26,8 @@
 #include "external/curl-8.19.0/include/curl/curl.h"
 #include "external/nlohmann/json.hpp"
 
+using json = nlohmann::json;
+
 // ---------------------------------------------------------------------------
 // Player entry — carries both the WCL numeric id and the display name so that
 // buttons can pass the id straight to fetchPersonalFightData().
@@ -51,7 +51,8 @@ struct Fight {
     std::vector<PlayerEntry> dps;
 };
 
-struct ReportData {
+struct ReportData
+{
     std::string title;
     std::string owner;
     std::vector<Fight> fights;
@@ -179,14 +180,57 @@ std::string FetchOAuthToken(const std::string& clientId, const std::string& clie
     return response;
 }
 
-std::string FetchReportData(const std::string& bearerToken, const std::string& reportCode) {
+// Helper to perform a single curl POST and return the response body
+static std::string curlPost(const std::string& url,
+                             const std::string& bearerToken,
+                             const std::string& jsonBody)
+{
     CURL* curl = curl_easy_init();
-    if (!curl) return "";
+    if (!curl) return "[error] curl_easy_init() failed";
 
     std::string response;
+    struct curl_slist* headers = nullptr;
+    std::string authHeader = "Authorization: Bearer " + bearerToken;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, authHeader.c_str());
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonBody.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK)
+        response = std::string("[curl error] ") + curl_easy_strerror(res);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return response;
+}
+
+static std::string jsonEscape(const std::string& s)
+{
+    std::string out;
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+std::string FetchReportData(const std::string& bearerToken, const std::string& reportCode) {
+    const std::string API_URL = "https://www.warcraftlogs.com/api/v2/client";
 
     std::string query =
-        "{\"query\":\"{ reportData { report(code: \\\"" + reportCode + "\\\") {"
+        "{\"query\":\"{ reportData { report(code: \\\"" + jsonEscape(reportCode) + "\\\") {"
         "  title startTime endTime"
         "  owner { name }"
         "  playerDetails(startTime: 0, endTime: 99999999999)"
@@ -196,86 +240,197 @@ std::string FetchReportData(const std::string& bearerToken, const std::string& r
         "  }"
         "} } }\"}";
 
-    struct curl_slist* headers = nullptr;
-    std::string authHeader = "Authorization: Bearer " + bearerToken;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, authHeader.c_str());
+    std::cout << "[WCL] FetchReportData query:\n" << query << "\n";
 
-    curl_easy_setopt(curl, CURLOPT_URL, "https://www.warcraftlogs.com/api/v2/client");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    std::string response = curlPost(API_URL, bearerToken, query);
 
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        std::cout << "[WCL] DEBUG curl error: " << curl_easy_strerror(res) << "\n";
+    //std::cout << "[WCL] FetchReportData response:\n" << response << "\n";
+
+    try
+    {
+        json root = json::parse(response);
+        json& report = root["data"]["reportData"]["report"];
+
+        ReportData rd;
+        rd.title = report.value("title", "");
+        rd.owner = report["owner"].value("name", "");
+
+        // playerDetails comes back as a JSON object keyed by role
+        json& pd = report["playerDetails"]["data"]["playerDetails"];
+
+        // Build a quick id->name lookup from every role bucket
+        std::unordered_map<int, std::string> idToName;
+        for (auto& role : { "tanks", "healers", "dps" })
+        {
+            if (!pd.contains(role)) continue;
+            for (auto& p : pd[role])
+            {
+                int pid = p.value("id", -1);
+                if (pid != -1)
+                    idToName[pid] = p.value("name", "");
+            }
+        }
+
+        for (auto& f : report["fights"])
+        {
+            // Skip trash / non-boss entries that have no name
+            if (!f.contains("id")) continue;
+
+            Fight fight;
+            fight.id        = f.value("id", 0);
+            fight.name      = f.value("name", "");
+            fight.startTime = f.value("startTime", 0.0);
+            fight.endTime   = f.value("endTime",   0.0);
+            fight.percent   = f.value("bossPercentage", 0.0f);
+
+            if (!f["kill"].is_null())
+                fight.kill = f["kill"].get<bool>();
+
+            if (!f["difficulty"].is_null())
+                fight.difficulty = f["difficulty"].get<int>();
+
+            // Map friendlyPlayers ids -> PlayerEntry, bucketed by role
+            if (f.contains("friendlyPlayers"))
+            {
+                for (int pid : f["friendlyPlayers"])
+                {
+                    auto it = idToName.find(pid);
+                    std::string pname = (it != idToName.end()) ? it->second : "";
+
+                    // Determine role from playerDetails buckets
+                    auto inBucket = [&](const char* role) {
+                        if (!pd.contains(role)) return false;
+                        for (auto& p : pd[role])
+                            if (p.value("id", -1) == pid) return true;
+                        return false;
+                    };
+
+                    PlayerEntry pe{ pid, pname };
+                    if      (inBucket("tanks"))   fight.tanks.push_back(pe);
+                    else if (inBucket("healers"))  fight.healers.push_back(pe);
+                    else if (inBucket("dps"))      fight.dps.push_back(pe);
+                }
+            }
+
+            rd.fights.push_back(std::move(fight));
+        }
+
+        //if needed, store previous request command will go here
+    }
+    catch (const json::exception& e)
+    {
+        std::cerr << "[WCL] FetchReportData JSON parse error: " << e.what() << "\n";
     }
 
-    long httpCode = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-    std::cout << "[WCL] DEBUG HTTP status: " << httpCode << "\n";
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    std::cout << "[DEBUG]: FetchReportData() output:\n" + response + "\n";
     return response;
 }
 
-// ---------------------------------------------------------------------------
-// fetchPersonalFightData
-//   Queries the WCL v2 API for the summary table of a single player (sourceID)
-//   within the time window of the given fight.  Returns the raw JSON string
-//   from the server so the caller can display it verbatim for debugging.
-// ---------------------------------------------------------------------------
 std::string fetchPersonalFightData(const Fight&       fight,
                                    int                playerId,
                                    const std::string& reportCode,
                                    const std::string& bearerToken)
 {
-    CURL* curl = curl_easy_init();
-    if (!curl) return "[error] curl_easy_init() failed";
+    const std::string API_URL = "https://www.warcraftlogs.com/api/v2/client";
 
-    std::string response;
+    const std::string startStr = std::to_string(static_cast<long long>(fight.startTime));
+    const std::string endStr   = std::to_string(static_cast<long long>(fight.endTime));
+    const std::string pidStr   = std::to_string(playerId);
+    const std::string code     = jsonEscape(reportCode);
 
-    // Ask for the summary table for this player over the fight window.
-    // The `table` field returns a JSON blob with damage, healing, casts, etc.
-    std::string query =
-        "{\"query\":\"{ reportData { report(code: \\\"" + reportCode + "\\\") {"
-        "  table("
-        "    startTime: " + std::to_string(static_cast<long long>(fight.startTime)) + ","
-        "    endTime: "   + std::to_string(static_cast<long long>(fight.endTime))   + ","
-        "    sourceID: "  + std::to_string(playerId) +
-        "  )"
-        "} } }\"}";
+    json result;
 
-    std::cout << "[WCL] fetchPersonalFightData query:\n" << query << "\n";
+    // ----------------------------------------------------------------
+    //  1. Table query  (gear, stats, aggregated damage/healing totals)
+    // ----------------------------------------------------------------
+    {
+        std::string query =
+            "{\"query\":\"{ reportData { report(code: \\\"" + code + "\\\") {"
+            "  table("
+            "    startTime: " + startStr + ","
+            "    endTime: "   + endStr   + ","
+            "    sourceID: "  + pidStr   +
+            "  )"
+            "} } }\"}";
 
-    struct curl_slist* headers = nullptr;
-    std::string authHeader = "Authorization: Bearer " + bearerToken;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, authHeader.c_str());
+        //std::cout << "[WCL] table query:\n" << query << "\n";
 
-    curl_easy_setopt(curl, CURLOPT_URL, "https://www.warcraftlogs.com/api/v2/client");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        std::string tableResponse = curlPost(API_URL, bearerToken, query);
 
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        response = std::string("[curl error] ") + curl_easy_strerror(res);
+        //std::cout << "[WCL] table response:\n" << tableResponse << "\n";
+
+        try
+        {
+            json tableJson = json::parse(tableResponse);
+            result["table"] = tableJson["data"]["reportData"]["report"]["table"];
+        }
+        catch (const json::exception& e)
+        {
+            std::cerr << "[WCL] table JSON parse error: " << e.what() << "\n";
+            result["table"] = nullptr;
+        }
     }
 
-    long httpCode = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-    std::cout << "[WCL] fetchPersonalFightData HTTP status: " << httpCode << "\n";
+    // ----------------------------------------------------------------
+    //  2. Events query  (individual cast events, paginated)
+    //     All pages are merged into a single "events" array in result.
+    // ----------------------------------------------------------------
+    {
+        long long pageStart      = static_cast<long long>(fight.startTime);
+        const long long fightEnd = static_cast<long long>(fight.endTime);
+        int page = 0;
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return response;
+        result["events"] = json::array();
+
+        while (true)
+        {
+            std::string query =
+                "{\"query\":\"{ reportData { report(code: \\\"" + code + "\\\") {"
+                "  events("
+                "    startTime: " + std::to_string(pageStart) + ","
+                "    endTime: "   + endStr                     + ","
+                "    sourceID: "  + pidStr                      + ","
+                "    filterExpression: \\\"type = 'cast'\\\""
+                "  ) {"
+                "    data"
+                "    nextPageTimestamp"
+                "  }"
+                "} } }\"}";
+
+            std::cout << "[WCL] events page " << page << " query:\n" << query << "\n";
+
+            std::string pageResponse = curlPost(API_URL, bearerToken, query);
+
+            //std::cout << "[WCL] events page " << page << " response:\n" << pageResponse << "\n";
+
+            try
+            {
+                json pageJson  = json::parse(pageResponse);
+                json& events   = pageJson["data"]["reportData"]["report"]["events"];
+
+                // Merge this page's events into the result array
+                for (auto& event : events["data"])
+                    result["events"].push_back(event);
+
+                if (events["nextPageTimestamp"].is_null()) break;
+
+                long long nextTs = events["nextPageTimestamp"].get<long long>();
+                if (nextTs <= pageStart || nextTs >= fightEnd) break;
+
+                pageStart = nextTs;
+                ++page;
+            }
+            catch (const json::exception& e)
+            {
+                std::cerr << "[WCL] events page " << page
+                          << " JSON parse error: " << e.what() << "\n";
+                break;
+            }
+        }
+    }
+
+    std::cout << "[DEBUG]: fetchPersonalFightData() output:\n" + result.dump() + "\n";
+    return result.dump();
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +451,7 @@ static bool                  g_debugWindowOpen   = false;
 static std::atomic<bool>     g_debugFetching{ false };
 static std::string           g_debugWindowTitle;   // "PlayerName — FightName"
 static std::string           g_debugRawResponse;   // verbatim server JSON
+static int                   g_debugPlayerId = -1;
 
 int main(){
     static AllSpecs masterSpecList;
@@ -613,43 +769,41 @@ int main(){
                 const char*                     roleTag,
                 int                             wrapAfter)
             {
+                bool fetching = g_debugFetching.load();
+
                 for (int i = 0; i < (int)players.size(); ++i) {
                     const PlayerEntry& pe = players[i];
 
-                    // Unique ImGui id: "PlayerName##role_fightId_playerId"
                     std::string btnId = pe.name
-                                      + "##" + roleTag
-                                      + "_f" + std::to_string(fight.id)
-                                      + "_p" + std::to_string(pe.id);
+                                    + "##" + roleTag
+                                    + "_f" + std::to_string(fight.id)
+                                    + "_p" + std::to_string(pe.id);
 
-                    // Grey out the button while a per-player fetch is running.
-                    if (g_debugFetching.load()) ImGui::BeginDisabled();
+                    bool wasDisabled = fetching;          // snapshot BEFORE button + click handler
+                    if (wasDisabled) ImGui::BeginDisabled();
 
                     if (ImGui::Button(btnId.c_str())) {
-                        // Snapshot everything the background thread needs.
-                        int         capturedPid   = pe.id;
-                        std::string capturedName  = pe.name;
-                        std::string capturedFight = fight.name;
-                        Fight       capturedFightCopy = fight;   // copy the whole fight for startTime/endTime
-                        std::string capturedCode  = g_cachedReportCode;
-                        std::string capturedToken = g_cachedBearerToken;
+                        Fight       capturedFightCopy = fight;
+                        std::string capturedName      = pe.name;
+                        std::string capturedFight     = fight.name;
+                        int         capturedPid       = pe.id;
+                        std::string capturedCode      = g_cachedReportCode;
+                        std::string capturedToken     = g_cachedBearerToken;
 
                         {
                             std::lock_guard<std::mutex> dlock(g_debugMutex);
-                            g_debugWindowTitle   = capturedName + " — " + capturedFight;
-                            g_debugRawResponse   = "Fetching…";
-                            g_debugWindowOpen    = true;
+                            g_debugWindowTitle = capturedName + " — " + capturedFight;
+                            g_debugRawResponse = "Fetching\xe2\x80\xa6";
+                            g_debugWindowOpen  = true;
+                            g_debugPlayerId    = capturedPid; 
                         }
                         g_debugFetching = true;
+                        fetching        = true;           // update for NEXT iteration's BeginDisabled
 
                         std::thread([capturedFightCopy, capturedPid,
-                                     capturedCode, capturedToken]() {
+                                    capturedCode, capturedToken]() {
                             std::string raw = fetchPersonalFightData(
-                                capturedFightCopy,
-                                capturedPid,
-                                capturedCode,
-                                capturedToken);
-
+                                capturedFightCopy, capturedPid, capturedCode, capturedToken);
                             {
                                 std::lock_guard<std::mutex> dlock(g_debugMutex);
                                 g_debugRawResponse = raw;
@@ -658,7 +812,7 @@ int main(){
                         }).detach();
                     }
 
-                    if (g_debugFetching.load()) ImGui::EndDisabled();
+                    if (wasDisabled) ImGui::EndDisabled(); // matches the Begin above — always paired
 
                     if (wrapAfter > 0 && (i + 1) % wrapAfter != 0 && i + 1 < (int)players.size())
                         ImGui::SameLine();
@@ -736,14 +890,13 @@ int main(){
         ImGui::End();
 
         // -----------------------------------------------------------------------
-        // Per-player debug window
-        // Shows the raw JSON response from fetchPersonalFightData() as plain text.
+        // Per-player window
         // The window is resizable and scrollable so large payloads stay readable.
         // -----------------------------------------------------------------------
         if (g_debugWindowOpen) {
             std::lock_guard<std::mutex> dlock(g_debugMutex);
 
-            ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_Appearing);
+            ImGui::SetNextWindowSize(ImVec2(720, 600), ImGuiCond_Appearing);
             ImGui::SetNextWindowPos(
                 ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -752,16 +905,104 @@ int main(){
             ImGui::Begin(windowTitle.c_str(), &g_debugWindowOpen);
 
             if (g_debugFetching.load()) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Fetching from server…");
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Fetching from server...");
             } else {
-                // InputTextMultiline gives a scrollable, selectable text area —
-                // useful for copy-pasting the raw JSON out.
-                ImGui::InputTextMultiline(
-                    "##debugraw",
-                    const_cast<char*>(g_debugRawResponse.c_str()),
-                    g_debugRawResponse.size() + 1,
-                    ImVec2(-1.0f, -1.0f),
-                    ImGuiInputTextFlags_ReadOnly);
+                try {
+                    auto root       = json::parse(g_debugRawResponse);
+                    auto& tableData = root["table"]["data"];
+                    auto& info      = tableData["combatantInfo"];
+                    auto& stats     = info["stats"];
+
+                    // ── Resolve player identity from composition using cached player ID ──
+                    std::string playerName  = "Unknown";
+                    std::string playerClass = "Unknown";
+                    std::string playerSpec  = "Unknown";
+                    std::string playerRole  = "Unknown";
+
+                    if (tableData.contains("composition") && tableData["composition"].is_array()) {
+                        for (auto& member : tableData["composition"]) {
+                            if (!member.contains("id") || !member["id"].is_number()) continue;
+                            if (member["id"].get<int>() != g_debugPlayerId) continue;
+
+                            playerName  = member.value("name", "Unknown");
+                            playerClass = member.value("type", "Unknown");
+
+                            if (member.contains("specs") && member["specs"].is_array()
+                                && !member["specs"].empty()) {
+                                auto& spec = member["specs"][0];
+                                playerSpec = spec.value("spec", "Unknown");
+                                playerRole = spec.value("role", "Unknown");
+                            }
+                            break;
+                        }
+                    }
+
+                    float ilvl = tableData.value("itemLevel", 0.0f);
+
+                    // ── Name / Class / Spec banner ───────────────────────────────────────
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f), "%s", playerName.c_str());
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%s %s  |  Role: %s)",
+                                        playerSpec.c_str(), playerClass.c_str(), playerRole.c_str());
+                    ImGui::Separator();
+
+                    // ── Item Level ───────────────────────────────────────────────────────
+                    ImGui::Text("Item Level");
+                    ImGui::SameLine(160);
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "%.1f", ilvl);
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+
+                    // ── Primary Stats ────────────────────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Primary Stats");
+                    ImGui::Separator();
+
+                    auto printStat = [&](const char* label, const char* key,
+                                        ImVec4 col = ImVec4(1,1,1,1)) {
+                        if (stats.contains(key) && stats[key].contains("max")) {
+                            int val = stats[key]["max"].get<int>();
+                            ImGui::Text("  %s", label);
+                            ImGui::SameLine(160);
+                            ImGui::TextColored(col, "%d", val);
+                        }
+                    };
+
+                    printStat("Agility",   "Agility",   ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
+                    printStat("Strength",  "Strength",  ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
+                    printStat("Intellect", "Intellect", ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
+                    printStat("Stamina",   "Stamina",   ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
+
+                    ImGui::Spacing();
+
+                    // ── Secondary Stats ──────────────────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Secondary Stats");
+                    ImGui::Separator();
+
+                    printStat("Crit",         "Crit",         ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                    printStat("Haste",        "Haste",        ImVec4(0.4f, 1.0f, 0.4f, 1.0f));
+                    printStat("Mastery",      "Mastery",      ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
+                    printStat("Versatility",  "Versatility",  ImVec4(0.9f, 0.6f, 1.0f, 1.0f));
+
+                    ImGui::Spacing();
+
+                    // ── Defensive Stats ──────────────────────────────────────────────────
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Defensive Stats");
+                    ImGui::Separator();
+
+                    printStat("Armor",      "Armor",      ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+                    printStat("Leech",      "Leech",      ImVec4(0.6f, 1.0f, 0.6f, 1.0f));
+                    printStat("Avoidance",  "Avoidance",  ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+                    printStat("Speed",      "Speed",      ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+
+                } catch (const json::exception& e) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                                    "JSON parse error: %s", e.what());
+                }
             }
 
             ImGui::End();
