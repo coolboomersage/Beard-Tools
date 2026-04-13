@@ -28,6 +28,15 @@
 #include "external/curl-8.19.0/include/curl/curl.h"
 #include "external/nlohmann/json.hpp"
 
+// ---------------------------------------------------------------------------
+// Player entry — carries both the WCL numeric id and the display name so that
+// buttons can pass the id straight to fetchPersonalFightData().
+// ---------------------------------------------------------------------------
+struct PlayerEntry {
+    int         id;
+    std::string name;
+};
+
 struct Fight {
     int         id;
     std::string name;
@@ -37,9 +46,9 @@ struct Fight {
     std::optional<int>  difficulty;
     float       percent;
 
-    std::vector<std::string> tanks;
-    std::vector<std::string> healers;
-    std::vector<std::string> dps;
+    std::vector<PlayerEntry> tanks;
+    std::vector<PlayerEntry> healers;
+    std::vector<PlayerEntry> dps;
 };
 
 struct ReportData {
@@ -52,15 +61,12 @@ std::string getExecutableDirectory() {
     char buffer[1024];
     
     #ifdef _WIN32
-        // Windows implementation
         GetModuleFileNameA(NULL, buffer, sizeof(buffer));
     #else
-        // Linux implementation
         ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
         if (len != -1) {
             buffer[len] = '\0';
         } else {
-            // Fallback if /proc/self/exe doesn't work
             return ".";
         }
     #endif
@@ -121,11 +127,10 @@ std::string ExtractReportCode(const std::string& input) {
     const std::string marker = "/reports/";
     size_t pos = input.find(marker);
     if (pos == std::string::npos)
-        return input; // assume it's already a bare code
+        return input;
 
     std::string code = input.substr(pos + marker.size());
 
-    // Strip any trailing fragment (#...) or query string (?...)
     for (char stop : { '#', '?' }) {
         size_t cut = code.find(stop);
         if (cut != std::string::npos)
@@ -151,7 +156,7 @@ std::string FetchOAuthToken(const std::string& clientId, const std::string& clie
             size_t pos;
             if ((pos = line.find("token=")) != std::string::npos){
                 response = line.substr(pos + 6);
-                return(response); //early exit, no curl call needed
+                return(response);
             }
         }
     }
@@ -202,7 +207,7 @@ std::string FetchReportData(const std::string& bearerToken, const std::string& r
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_CAINFO, "cacert.pem");
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
@@ -218,18 +223,79 @@ std::string FetchReportData(const std::string& bearerToken, const std::string& r
     return response;
 }
 
-std::string ParseAccessToken(const std::string& json) {
-    const std::string key = "\"access_token\":\"";
-    size_t pos = json.find(key);
-    if (pos == std::string::npos) return "";
-    pos += key.size();
-    size_t end = json.find('"', pos);
-    return json.substr(pos, end - pos);
+// ---------------------------------------------------------------------------
+// fetchPersonalFightData
+//   Queries the WCL v2 API for the summary table of a single player (sourceID)
+//   within the time window of the given fight.  Returns the raw JSON string
+//   from the server so the caller can display it verbatim for debugging.
+// ---------------------------------------------------------------------------
+std::string fetchPersonalFightData(const Fight&       fight,
+                                   int                playerId,
+                                   const std::string& reportCode,
+                                   const std::string& bearerToken)
+{
+    CURL* curl = curl_easy_init();
+    if (!curl) return "[error] curl_easy_init() failed";
+
+    std::string response;
+
+    // Ask for the summary table for this player over the fight window.
+    // The `table` field returns a JSON blob with damage, healing, casts, etc.
+    std::string query =
+        "{\"query\":\"{ reportData { report(code: \\\"" + reportCode + "\\\") {"
+        "  table("
+        "    startTime: " + std::to_string(static_cast<long long>(fight.startTime)) + ","
+        "    endTime: "   + std::to_string(static_cast<long long>(fight.endTime))   + ","
+        "    sourceID: "  + std::to_string(playerId) +
+        "  )"
+        "} } }\"}";
+
+    std::cout << "[WCL] fetchPersonalFightData query:\n" << query << "\n";
+
+    struct curl_slist* headers = nullptr;
+    std::string authHeader = "Authorization: Bearer " + bearerToken;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, authHeader.c_str());
+
+    curl_easy_setopt(curl, CURLOPT_URL, "https://www.warcraftlogs.com/api/v2/client");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        response = std::string("[curl error] ") + curl_easy_strerror(res);
+    }
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    std::cout << "[WCL] fetchPersonalFightData HTTP status: " << httpCode << "\n";
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return response;
 }
 
+// ---------------------------------------------------------------------------
+// Global state shared between the main thread and the background fetch thread
+// ---------------------------------------------------------------------------
 static ReportData            g_report;
 static std::mutex            g_reportMutex;
 static std::atomic<bool>     g_reportReady{ false };
+
+// Cached after the first successful report fetch so that player-button clicks
+// can re-use the same credentials without threading headaches.
+static std::string           g_cachedReportCode;
+static std::string           g_cachedBearerToken;
+
+// Debug window for per-player data
+static std::mutex            g_debugMutex;
+static bool                  g_debugWindowOpen   = false;
+static std::atomic<bool>     g_debugFetching{ false };
+static std::string           g_debugWindowTitle;   // "PlayerName — FightName"
+static std::string           g_debugRawResponse;   // verbatim server JSON
 
 int main(){
     static AllSpecs masterSpecList;
@@ -237,7 +303,7 @@ int main(){
     static bool tokenFetched = false;
     static char wclUrlBuf[512] = "";
     static std::atomic<bool> isFetching(false);
-    static std::string fetchStatus;  // shown in UI
+    static std::string fetchStatus;
     std::vector<std::string> keys;
     std::string errorMsg;
 
@@ -251,7 +317,7 @@ int main(){
                     if (!existing.empty()) {
                         tokenResponse = existing;
                         tokenFetched  = true;
-                        return;                                // early-out, no network call needed
+                        return;
                     }
                 }
             }
@@ -284,7 +350,7 @@ int main(){
                 if (j.contains("access_token"))
                     tokenResponse = j["access_token"].get<std::string>();
                 else
-                    tokenResponse = responseBuffer; // show raw on unexpected shape
+                    tokenResponse = responseBuffer;
             } catch (...) {
                 tokenResponse = "JSON parse error: " + responseBuffer;
             }
@@ -318,7 +384,7 @@ int main(){
     }
 
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // Enable vsync
+    glfwSwapInterval(1);
 
     // Initialize ImGui
     IMGUI_CHECKVERSION();
@@ -341,7 +407,7 @@ int main(){
         ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(880, 320), ImGuiCond_Always);  // taller to fit new row
+        ImGui::SetNextWindowSize(ImVec2(880, 320), ImGuiCond_Always);
 
         ImGui::Begin("Main Window", nullptr,
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
@@ -363,11 +429,10 @@ int main(){
 
         ImGui::SameLine();
 
-        // Disable button while a fetch is in progress
         if (currentlyFetching) ImGui::BeginDisabled();
 
         if (ImGui::Button("Fetch Log")) {
-            std::string urlCopy = wclUrlBuf;
+            std::string urlCopy      = wclUrlBuf;
             std::string clientId     = keys[0];
             std::string clientSecret = keys[1];
 
@@ -383,7 +448,6 @@ int main(){
                 try {
                     auto root = nlohmann::json::parse(reportJson);
 
-                    // Guard against API error responses
                     if (!root.contains("data") || root["data"].is_null() ||
                         !root["data"].contains("reportData") || root["data"]["reportData"].is_null() ||
                         !root["data"]["reportData"].contains("report") || root["data"]["reportData"]["report"].is_null()) {
@@ -443,30 +507,34 @@ int main(){
                         if (!f.is_object()) continue;
 
                         Fight fight;
-                        fight.id        = f.contains("id")        && f["id"].is_number()        ? f["id"].get<int>()          : 0;
+                        fight.id        = f.contains("id")        && f["id"].is_number()        ? f["id"].get<int>()           : 0;
                         fight.name      = f.contains("name")      && f["name"].is_string()      ? f["name"].get<std::string>() : "";
                         fight.startTime = f.contains("startTime") && f["startTime"].is_number() ? f["startTime"].get<double>() : 0.0;
                         fight.endTime   = f.contains("endTime")   && f["endTime"].is_number()   ? f["endTime"].get<double>()   : 0.0;
                         fight.percent   = f.contains("bossPercentage") && f["bossPercentage"].is_number()
                                             ? f["bossPercentage"].get<double>() : 0.0;
 
-                        if (!f.contains("kill")        || f["kill"].is_null())        { continue; }
-                        if (!f.contains("difficulty")  || f["difficulty"].is_null())  { continue; }
+                        if (!f.contains("kill")       || f["kill"].is_null())       { continue; }
+                        if (!f.contains("difficulty") || f["difficulty"].is_null()) { continue; }
 
                         fight.kill       = f["kill"].get<bool>();
                         fight.difficulty = f["difficulty"].get<int>();
 
                         // --- Cross-reference friendlyPlayers against lookup ---
+                        // Store both the numeric id and the name so buttons can
+                        // hand the id straight to fetchPersonalFightData().
                         if (f.contains("friendlyPlayers") && f["friendlyPlayers"].is_array()) {
                             for (auto& pidVal : f["friendlyPlayers"]) {
                                 if (!pidVal.is_number()) continue;
-                                auto it = playerLookup.find(pidVal.get<int>());
+                                int pid = pidVal.get<int>();
+                                auto it = playerLookup.find(pid);
                                 if (it == playerLookup.end()) continue;
 
                                 const auto& info = it->second;
-                                if      (info.role == "tanks")   fight.tanks.push_back(info.name);
-                                else if (info.role == "healers")  fight.healers.push_back(info.name);
-                                else if (info.role == "dps")      fight.dps.push_back(info.name);
+                                PlayerEntry entry{ pid, info.name };
+                                if      (info.role == "tanks")   fight.tanks.push_back(entry);
+                                else if (info.role == "healers") fight.healers.push_back(entry);
+                                else if (info.role == "dps")     fight.dps.push_back(entry);
                             }
                         }
 
@@ -475,7 +543,9 @@ int main(){
 
                     {
                         std::lock_guard<std::mutex> lock(g_reportMutex);
-                        g_report = std::move(parsed);
+                        g_report            = std::move(parsed);
+                        g_cachedReportCode  = reportCode;
+                        g_cachedBearerToken = tokenJson;
                     }
                     g_reportReady = true;
                     fetchStatus   = "Done";
@@ -506,7 +576,6 @@ int main(){
             ImGui::Text("Report: %s  (owner: %s)", g_report.title.c_str(), g_report.owner.c_str());
             ImGui::Spacing();
 
-            // Helper: difficulty int -> label
             auto diffLabel = [](std::optional<int> d) -> const char* {
                 if (!d) return "—";
                 switch (*d) {
@@ -519,24 +588,83 @@ int main(){
                 }
             };
 
-            // Helper: kill -> header colour
             auto headerColor = [](std::optional<bool> kill) -> ImVec4 {
-                if (!kill)    return ImVec4(0.35f, 0.35f, 0.35f, 1.0f); // trash / unknown — grey
-                if (*kill)    return ImVec4(0.10f, 0.45f, 0.10f, 1.0f); // kill — green
-                return             ImVec4(0.50f, 0.10f, 0.10f, 1.0f); // wipe — red
+                if (!kill)  return ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
+                if (*kill)  return ImVec4(0.10f, 0.45f, 0.10f, 1.0f);
+                return           ImVec4(0.50f, 0.10f, 0.10f, 1.0f);
             };
             auto headerColorHov = [](std::optional<bool> kill) -> ImVec4 {
-                if (!kill)    return ImVec4(0.45f, 0.45f, 0.45f, 1.0f);
-                if (*kill)    return ImVec4(0.15f, 0.60f, 0.15f, 1.0f);
-                return             ImVec4(0.65f, 0.15f, 0.15f, 1.0f);
+                if (!kill)  return ImVec4(0.45f, 0.45f, 0.45f, 1.0f);
+                if (*kill)  return ImVec4(0.15f, 0.60f, 0.15f, 1.0f);
+                return           ImVec4(0.65f, 0.15f, 0.15f, 1.0f);
             };
             auto headerColorAct = [](std::optional<bool> kill) -> ImVec4 {
-                if (!kill)    return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
-                if (*kill)    return ImVec4(0.20f, 0.70f, 0.20f, 1.0f);
-                return             ImVec4(0.75f, 0.20f, 0.20f, 1.0f);
+                if (!kill)  return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
+                if (*kill)  return ImVec4(0.20f, 0.70f, 0.20f, 1.0f);
+                return           ImVec4(0.75f, 0.20f, 0.20f, 1.0f);
             };
 
-            // Scrollable child region so the window doesn't grow unbounded
+            // Helper that renders a row of player buttons and fires off a
+            // background fetch when any of them is clicked.
+            // Capture by value so the lambda is safe to call from the thread.
+            auto renderPlayerButtons = [&](
+                const std::vector<PlayerEntry>& players,
+                const Fight&                    fight,
+                const char*                     roleTag,
+                int                             wrapAfter)
+            {
+                for (int i = 0; i < (int)players.size(); ++i) {
+                    const PlayerEntry& pe = players[i];
+
+                    // Unique ImGui id: "PlayerName##role_fightId_playerId"
+                    std::string btnId = pe.name
+                                      + "##" + roleTag
+                                      + "_f" + std::to_string(fight.id)
+                                      + "_p" + std::to_string(pe.id);
+
+                    // Grey out the button while a per-player fetch is running.
+                    if (g_debugFetching.load()) ImGui::BeginDisabled();
+
+                    if (ImGui::Button(btnId.c_str())) {
+                        // Snapshot everything the background thread needs.
+                        int         capturedPid   = pe.id;
+                        std::string capturedName  = pe.name;
+                        std::string capturedFight = fight.name;
+                        Fight       capturedFightCopy = fight;   // copy the whole fight for startTime/endTime
+                        std::string capturedCode  = g_cachedReportCode;
+                        std::string capturedToken = g_cachedBearerToken;
+
+                        {
+                            std::lock_guard<std::mutex> dlock(g_debugMutex);
+                            g_debugWindowTitle   = capturedName + " — " + capturedFight;
+                            g_debugRawResponse   = "Fetching…";
+                            g_debugWindowOpen    = true;
+                        }
+                        g_debugFetching = true;
+
+                        std::thread([capturedFightCopy, capturedPid,
+                                     capturedCode, capturedToken]() {
+                            std::string raw = fetchPersonalFightData(
+                                capturedFightCopy,
+                                capturedPid,
+                                capturedCode,
+                                capturedToken);
+
+                            {
+                                std::lock_guard<std::mutex> dlock(g_debugMutex);
+                                g_debugRawResponse = raw;
+                            }
+                            g_debugFetching = false;
+                        }).detach();
+                    }
+
+                    if (g_debugFetching.load()) ImGui::EndDisabled();
+
+                    if (wrapAfter > 0 && (i + 1) % wrapAfter != 0 && i + 1 < (int)players.size())
+                        ImGui::SameLine();
+                }
+            };
+
             ImGui::BeginChild("##fights", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
             for (auto& fight : g_report.fights) {
@@ -544,7 +672,6 @@ int main(){
                 int    mins        = static_cast<int>(durationSec) / 60;
                 int    secs        = static_cast<int>(durationSec) % 60;
 
-                // Build a readable label: "[id] Name  (diff)  dur  kill/wipe/—"
                 const char* killStr = fight.kill ? (*fight.kill ? "Kill" : "Wipe") : "—";
                 char label[256];
                 char percentStr[16];
@@ -569,11 +696,7 @@ int main(){
                     if (!fight.tanks.empty()) {
                         ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), "Tanks");
                         ImGui::Spacing();
-                        for (auto& name : fight.tanks) {
-                            std::string btnId = name + "##tank_" + std::to_string(fight.id);
-                            ImGui::Button(btnId.c_str());
-                            ImGui::SameLine();
-                        }
+                        renderPlayerButtons(fight.tanks, fight, "tank", 0 /*no wrap*/);
                         ImGui::NewLine();
                         ImGui::Spacing();
                     }
@@ -582,12 +705,7 @@ int main(){
                     if (!fight.healers.empty()) {
                         ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Healers");
                         ImGui::Spacing();
-                        for (int i = 0; i < (int)fight.healers.size(); i++) {
-                            std::string btnId = fight.healers[i] + "##heal_" + std::to_string(fight.id);
-                            ImGui::Button(btnId.c_str());
-                            if ((i + 1) % 5 != 0 && i + 1 < (int)fight.healers.size())
-                                ImGui::SameLine();
-                        }
+                        renderPlayerButtons(fight.healers, fight, "heal", 5);
                         ImGui::NewLine();
                         ImGui::Spacing();
                     }
@@ -596,12 +714,7 @@ int main(){
                     if (!fight.dps.empty()) {
                         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "DPS");
                         ImGui::Spacing();
-                        for (int i = 0; i < (int)fight.dps.size(); i++) {
-                            std::string btnId = fight.dps[i] + "##dps_" + std::to_string(fight.id);
-                            ImGui::Button(btnId.c_str());
-                            if ((i + 1) % 5 != 0 && i + 1 < (int)fight.dps.size())
-                                ImGui::SameLine();
-                        }
+                        renderPlayerButtons(fight.dps, fight, "dps", 5);
                         ImGui::NewLine();
                         ImGui::Spacing();
                     }
@@ -622,6 +735,38 @@ int main(){
 
         ImGui::End();
 
+        // -----------------------------------------------------------------------
+        // Per-player debug window
+        // Shows the raw JSON response from fetchPersonalFightData() as plain text.
+        // The window is resizable and scrollable so large payloads stay readable.
+        // -----------------------------------------------------------------------
+        if (g_debugWindowOpen) {
+            std::lock_guard<std::mutex> dlock(g_debugMutex);
+
+            ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_Appearing);
+            ImGui::SetNextWindowPos(
+                ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+            std::string windowTitle = "[DEBUG] " + g_debugWindowTitle;
+            ImGui::Begin(windowTitle.c_str(), &g_debugWindowOpen);
+
+            if (g_debugFetching.load()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Fetching from server…");
+            } else {
+                // InputTextMultiline gives a scrollable, selectable text area —
+                // useful for copy-pasting the raw JSON out.
+                ImGui::InputTextMultiline(
+                    "##debugraw",
+                    const_cast<char*>(g_debugRawResponse.c_str()),
+                    g_debugRawResponse.size() + 1,
+                    ImVec2(-1.0f, -1.0f),
+                    ImGuiInputTextFlags_ReadOnly);
+            }
+
+            ImGui::End();
+        }
+
         ImGui::Render();
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
@@ -640,5 +785,4 @@ int main(){
     glfwTerminate();
 
     return 0;
-
 }

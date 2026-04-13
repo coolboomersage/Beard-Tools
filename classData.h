@@ -11,14 +11,14 @@ struct WoWclass {
         std::vector<int> getRotSpells() const { return rotSpells; }
         std::vector<int> getUtilSpells() const { return utilSpells; }
         std::vector<int> getAllSpells() const {
-                std::vector<int> allSpells;
-                for (auto x : std::vector<std::vector<int>> {defSpells , offSpells , mobSpells , rotSpells , utilSpells}){
-                    for (auto y : x){
-                        allSpells.push_back(y);
-                    }
+            std::vector<int> allSpells;
+            for (auto x : std::vector<std::vector<int>> {defSpells , offSpells , mobSpells , rotSpells , utilSpells}){
+                for (auto y : x){
+                    allSpells.push_back(y);
                 }
-                return (allSpells);
             }
+            return (allSpells);
+        }
 
         void setDefSpells(const std::vector<int>& spells) { defSpells = spells; }
         void setOffSpells(const std::vector<int>& spells) { offSpells = spells; }
