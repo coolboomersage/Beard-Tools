@@ -30,6 +30,57 @@
 
 using json = nlohmann::json;
 
+// ── WoW item upgrade track bonus IDs -> display colour ───────────────────────
+// These bonus IDs are season-specific. Update each new season/patch.
+// Season 1 - Midnight (patch 12.0)
+struct UpgradeTrack {
+    int         bonusID;
+    const char* name;
+    ImVec4      color;
+};
+
+// These are the rank-family IDs that encode both track and rank.
+// 1279x = Hero track, 1280x = Myth track, 1281x = unknown (possibly Hero too)
+// From observed data:
+//   12794 = Hero 2/6,  12795 = Hero 3/6,  12796 = Hero 4/6
+//   12797 = Hero 5/6,  12798 = Hero 6/6
+//   12799 = Veteran?   12800 = Veteran?    12801 = Champ?
+//   12802 = Myth 2/6,  12803 = Myth 3/6,  12804 = Myth 4/6
+//   12805 = Myth 5/6,  12806 = Myth 6/6
+// Lower rank IDs per track are inferred — only 12794-12798 and 12802/12806 confirmed.
+// The 12699 ID appears on Hero items without a clear rank, possibly an older season marker.
+static const UpgradeTrack kUpgradeTracks[] = {
+    // ── Hero track (12794-12798) ─────────────────────────────────────────
+    { 12794, "Hero 2/6",    ImVec4(1.0f, 0.85f, 0.0f, 1.0f) },
+    { 12795, "Hero 3/6",    ImVec4(1.0f, 0.85f, 0.0f, 1.0f) },
+    { 12796, "Hero 4/6",    ImVec4(1.0f, 0.85f, 0.0f, 1.0f) },
+    { 12797, "Hero 5/6",    ImVec4(1.0f, 0.85f, 0.0f, 1.0f) },
+    { 12798, "Hero 6/6",    ImVec4(1.0f, 0.85f, 0.0f, 1.0f) },
+    // ── Myth track (12802-12806) ─────────────────────────────────────────
+    { 12802, "Myth 2/6",    ImVec4(0.4f, 1.0f, 0.9f, 1.0f) },
+    { 12803, "Myth 3/6",    ImVec4(0.4f, 1.0f, 0.9f, 1.0f) },
+    { 12804, "Myth 4/6",    ImVec4(0.4f, 1.0f, 0.9f, 1.0f) },
+    { 12805, "Myth 5/6",    ImVec4(0.4f, 1.0f, 0.9f, 1.0f) },
+    { 12806, "Myth 6/6",    ImVec4(0.4f, 1.0f, 0.9f, 1.0f) },
+    // ── Champion track (12790-12793) — inferred, only 12790 confirmed ────
+    { 12790, "Champ ?/6",   ImVec4(0.7f, 0.3f, 1.0f, 1.0f) },
+    { 12791, "Champ ?/6",   ImVec4(0.7f, 0.3f, 1.0f, 1.0f) },
+    { 12792, "Champ ?/6",   ImVec4(0.7f, 0.3f, 1.0f, 1.0f) },
+    { 12793, "Champ ?/6",   ImVec4(0.7f, 0.3f, 1.0f, 1.0f) },
+    // ── Veteran track (12785-12789) — fully inferred ─────────────────────
+    { 12785, "Veteran ?/6", ImVec4(0.3f, 0.5f, 1.0f, 1.0f) },
+    { 12786, "Veteran ?/6", ImVec4(0.3f, 0.5f, 1.0f, 1.0f) },
+    { 12787, "Veteran ?/6", ImVec4(0.3f, 0.5f, 1.0f, 1.0f) },
+    { 12788, "Veteran ?/6", ImVec4(0.3f, 0.5f, 1.0f, 1.0f) },
+    { 12789, "Veteran ?/6", ImVec4(0.3f, 0.5f, 1.0f, 1.0f) },
+    // ── Adventurer track (12780-12784) — fully inferred ──────────────────
+    { 12780, "Adv ?/6",     ImVec4(0.1f, 0.8f, 0.1f, 1.0f) },
+    { 12781, "Adv ?/6",     ImVec4(0.1f, 0.8f, 0.1f, 1.0f) },
+    { 12782, "Adv ?/6",     ImVec4(0.1f, 0.8f, 0.1f, 1.0f) },
+    { 12783, "Adv ?/6",     ImVec4(0.1f, 0.8f, 0.1f, 1.0f) },
+    { 12784, "Adv ?/6",     ImVec4(0.1f, 0.8f, 0.1f, 1.0f) },
+};
+
 // ---------------------------------------------------------------------------
 // Player entry — carries both the WCL numeric id and the display name so that
 // buttons can pass the id straight to fetchPersonalFightData().
@@ -1038,6 +1089,182 @@ int main(){
 
                     ImGui::Spacing();
                     ImGui::Separator();
+
+                    // ── Equipped Gear ────────────────────────────────────────────────────────
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Equipped Gear");
+                    ImGui::Separator();
+
+                    if (info.contains("gear") && info["gear"].is_array()) {
+                        auto& gear = info["gear"];
+
+                        // ── Resolve upgrade track colour for a single item ───────────────────
+                        // Returns true and sets 'out' if a known track bonus ID is found.
+                        // Returns false if no track ID matched (caller should use ilvl fallback).
+                        auto trackColor = [&](const json& item, ImVec4& out) -> bool {
+                            if (!item.contains("bonusIDs") || !item["bonusIDs"].is_array())
+                                return false;
+                            for (auto& bid : item["bonusIDs"]) {
+                                if (!bid.is_number_integer()) continue;
+                                int id = bid.get<int>();
+                                for (auto& track : kUpgradeTracks) {
+                                    if (track.bonusID == id) {
+                                        out = track.color;
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        };
+
+                        // ── ilvl gradient fallback (white -> green -> blue -> purple -> gold) ───
+                        int minIlvl = INT_MAX, maxIlvl = 0;
+                        for (auto& item : gear) {
+                            if (item.value("id", 0) == 0) continue;
+                            int ilvl = item.value("itemLevel", 0);
+                            if (ilvl <= 1) continue;
+                            if (ilvl < minIlvl) minIlvl = ilvl;
+                            if (ilvl > maxIlvl) maxIlvl = ilvl;
+                        }
+
+                        bool allSame = (maxIlvl == 0) || (minIlvl == maxIlvl);
+
+                        struct GradStop { float t, r, g, b; };
+                        static constexpr GradStop kStops[] = {
+                            { 0.00f, 1.0f, 1.0f,  1.0f  },  // white
+                            { 0.25f, 0.1f, 1.0f,  0.1f  },  // green
+                            { 0.50f, 0.3f, 0.5f,  1.0f  },  // blue
+                            { 0.75f, 0.7f, 0.3f,  1.0f  },  // purple
+                            { 1.00f, 1.0f, 0.85f, 0.0f  },  // gold
+                        };
+
+                        auto ilvlColor = [&](int ilvl) -> ImVec4 {
+                            if (ilvl <= 1 || maxIlvl == 0)
+                                return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);   // grey — cosmetic/empty
+                            float t = allSame ? 1.0f
+                                            : std::clamp((float)(ilvl - minIlvl)
+                                                        / (float)(maxIlvl - minIlvl), 0.0f, 1.0f);
+                            for (int i = 0; i < 4; ++i) {
+                                if (t <= kStops[i + 1].t) {
+                                    float s = (t - kStops[i].t) / (kStops[i + 1].t - kStops[i].t);
+                                    return ImVec4(kStops[i].r + s * (kStops[i+1].r - kStops[i].r),
+                                                kStops[i].g + s * (kStops[i+1].g - kStops[i].g),
+                                                kStops[i].b + s * (kStops[i+1].b - kStops[i].b),
+                                                1.0f);
+                                }
+                            }
+                            return ImVec4(kStops[4].r, kStops[4].g, kStops[4].b, 1.0f);
+                        };
+
+                        // ── Resolve final colour for an item ─────────────────────────────────────
+                        // Priority: tier red > upgrade track (rank-family ID) > ilvl gradient fallback
+                        auto resolveColor = [&](const json& item) -> ImVec4 {
+                            if (item.value("id", 0) == 0)
+                                return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);   // grey — empty slot
+
+                            if (item.contains("setID"))
+                                return ImVec4(1.0f, 0.2f, 0.2f, 1.0f);       // red — tier/set piece
+
+                            ImVec4 trackCol;
+                            if (trackColor(item, trackCol))
+                                return trackCol;                               // rank-family track colour
+
+                            // Crafted items, old world items, or anything else with no rank ID:
+                            // fall back to ilvl gradient so they still get a meaningful colour
+                            // rather than being invisible against the background.
+                            return ilvlColor(item.value("itemLevel", 0));
+                        };
+
+                        // ── Slot label lookup ─────────────────────────────────────────────────
+                        static const char* kSlotLabel[18] = {
+                            "Head",      "Neck",      "Shoulders", "Shirt",
+                            "Chest",     "Waist",     "Legs",      "Feet",
+                            "Wrists",    "Hands",     "Ring 1",    "Ring 2",
+                            "Trinket 1", "Trinket 2", "Back",      "Main Hand",
+                            "Off Hand",  "Ranged"
+                        };
+
+                        // ── Build slot -> item map ─────────────────────────────────────────────
+                        std::map<int, const json*> slotMap;
+                        for (auto& item : gear) {
+                            int s = item.value("slot", -1);
+                            if (s >= 0 && s < 18)
+                                slotMap[s] = &item;
+                        }
+
+                        // ── Render one slot row ───────────────────────────────────────────────
+                        auto renderSlot = [&](int slot) {
+                            const char* label = (slot >= 0 && slot < 18) ? kSlotLabel[slot] : "?";
+                            auto it = slotMap.find(slot);
+
+                            if (it == slotMap.end() || it->second->value("id", 0) == 0) {
+                                ImGui::TextDisabled("  %-11s  —", label);
+                                return;
+                            }
+
+                            auto& item = *it->second;
+                            auto  name = item.value("name", "Unknown");
+                            int   ilvl = item.value("itemLevel", 0);
+
+                            // Show track name in tooltip so the user knows why the color was chosen
+                            ImGui::TextDisabled("  %-11s", label);
+                            ImGui::SameLine();
+                            ImGui::TextColored(resolveColor(item), "%s - %d", name.c_str(), ilvl);
+
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::BeginTooltip();
+                                ImVec4 trackCol;
+                                if (item.contains("setID")) {
+                                    // Show tier/set label in red
+                                    ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "Tier / Set Piece");
+
+                                    // Also scan for a rank-family ID so we can show the upgrade info
+                                    // without changing the item's display colour
+                                    for (auto& track : kUpgradeTracks) {
+                                        bool matched = item.contains("bonusIDs") &&
+                                                    item["bonusIDs"].end() != std::find_if(
+                                                        item["bonusIDs"].begin(), item["bonusIDs"].end(),
+                                                        [&](const json& b){ return b.is_number_integer()
+                                                                                && b.get<int>() == track.bonusID; });
+                                        if (matched) {
+                                            ImGui::TextColored(track.color, "Upgrade: %s", track.name);
+                                            break;
+                                        }
+                                    }
+                                } else if (trackColor(item, trackCol)) {
+                                    for (auto& track : kUpgradeTracks) {
+                                        bool matched = item.contains("bonusIDs") &&
+                                                    item["bonusIDs"].end() != std::find_if(
+                                                        item["bonusIDs"].begin(), item["bonusIDs"].end(),
+                                                        [&](const json& b){ return b.is_number_integer()
+                                                                                && b.get<int>() == track.bonusID; });
+                                        if (matched) {
+                                            ImGui::TextColored(trackCol, "Track: %s", track.name);
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    ImGui::TextDisabled("Track: Unknown (ilvl fallback)");
+                                }
+                                ImGui::EndTooltip();
+                            }
+                        };
+
+                        // ── WoW character sheet layout ────────────────────────────────────────
+                        static const int kLeftSlots[]  = { 0, 1, 2, 14, 4, 3, 8 };
+                        static const int kRightSlots[] = { 9, 5, 6, 7, 10, 11, 12, 13 };
+
+                        ImGui::Columns(2, "##gearCols", false);
+                        for (int s : kLeftSlots)  renderSlot(s);
+                        ImGui::NextColumn();
+                        for (int s : kRightSlots) renderSlot(s);
+                        ImGui::Columns(1);
+
+                        // ── Weapons span full width beneath both columns ──────────────────────
+                        ImGui::Separator();
+                        renderSlot(15);  // Main Hand
+                        renderSlot(16);  // Off Hand
+                    }
 
                 } catch (const json::exception& e) {
                     ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
