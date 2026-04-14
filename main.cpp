@@ -9,6 +9,7 @@
 #include <atomic>
 #include <optional>
 #include <mutex>
+#include <unordered_set>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -1265,6 +1266,192 @@ int main(){
                         renderSlot(15);  // Main Hand
                         renderSlot(16);  // Off Hand
                     }
+
+                // ── Spell Cast Timelines ──────────────────────────────────────────────────────
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Spell Cast Timelines");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // ── Resolve player's WoWclass from the composition strings ───────────────────
+                const WoWclass* pwc = nullptr;
+                {
+                    struct SpecEntry { const char* cls; const char* spec; const WoWclass* wc; };
+                    const SpecEntry kSpecMap[] = {
+                        // Warrior
+                        { "Warrior",     "Arms",          &masterSpecList.armsWarrior        },
+                        { "Warrior",     "Fury",          &masterSpecList.furyWarrior        },
+                        { "Warrior",     "Protection",    &masterSpecList.protWarrior        },
+                        // Paladin
+                        { "Paladin",     "Holy",          &masterSpecList.holyPaladin        },
+                        { "Paladin",     "Protection",    &masterSpecList.protPaladin        },
+                        { "Paladin",     "Retribution",   &masterSpecList.retPaladin         },
+                        // Hunter
+                        { "Hunter",      "BeastMastery",  &masterSpecList.bmHunter           },
+                        { "Hunter",      "Marksmanship",  &masterSpecList.mmHunter           },
+                        { "Hunter",      "Survival",      &masterSpecList.survivalHunter     },
+                        // Rogue
+                        { "Rogue",       "Assassination", &masterSpecList.assassinationRogue },
+                        { "Rogue",       "Outlaw",        &masterSpecList.outlawRogue        },
+                        { "Rogue",       "Subtlety",      &masterSpecList.subtletyRogue      },
+                        // Priest
+                        { "Priest",      "Discipline",    &masterSpecList.discPriest         },
+                        { "Priest",      "Holy",          &masterSpecList.holyPriest         },
+                        { "Priest",      "Shadow",        &masterSpecList.shadowPriest       },
+                        // Death Knight
+                        { "DeathKnight", "Blood",         &masterSpecList.bloodDK            },
+                        { "DeathKnight", "Frost",         &masterSpecList.frostDK            },
+                        { "DeathKnight", "Unholy",        &masterSpecList.unholyDK           },
+                        // Shaman
+                        { "Shaman",      "Elemental",     &masterSpecList.elementalShaman    },
+                        { "Shaman",      "Enhancement",   &masterSpecList.enhancementShaman  },
+                        { "Shaman",      "Restoration",   &masterSpecList.restoShaman        },
+                        // Mage
+                        { "Mage",        "Arcane",        &masterSpecList.arcaneMage         },
+                        { "Mage",        "Fire",          &masterSpecList.fireMage           },
+                        { "Mage",        "Frost",         &masterSpecList.frostMage          },
+                        // Warlock
+                        { "Warlock",     "Affliction",    &masterSpecList.afflictionWarlock  },
+                        { "Warlock",     "Demonology",    &masterSpecList.demoWarlock        },
+                        { "Warlock",     "Destruction",   &masterSpecList.destroWarlock      },
+                        // Monk
+                        { "Monk",        "Brewmaster",    &masterSpecList.brewmasterMonk     },
+                        { "Monk",        "Mistweaver",    &masterSpecList.mistweaverMonk     },
+                        { "Monk",        "Windwalker",    &masterSpecList.windwalkerMonk     },
+                        // Druid
+                        { "Druid",       "Balance",       &masterSpecList.balanceDruid       },
+                        { "Druid",       "Feral",         &masterSpecList.feralDruid         },
+                        { "Druid",       "Guardian",      &masterSpecList.guardianDruid      },
+                        { "Druid",       "Restoration",   &masterSpecList.restoDruid         },
+                        // Demon Hunter
+                        { "DemonHunter", "Havoc",         &masterSpecList.havocDH            },
+                        { "DemonHunter", "Vengeance",     &masterSpecList.vengeanceDH        },
+                        // Evoker
+                        { "Evoker",      "Devastation",   &masterSpecList.devastationEvoker  },
+                        { "Evoker",      "Preservation",  &masterSpecList.preservationEvoker },
+                        { "Evoker",      "Augmentation",  &masterSpecList.augmentationEvoker },
+                    };
+
+                    for (auto& entry : kSpecMap) {
+                        if (playerClass == entry.cls && playerSpec == entry.spec) {
+                            pwc = entry.wc;
+                            break;
+                        }
+                    }
+                }
+
+                if (!pwc) {
+                    ImGui::TextDisabled("No hardcoded spell data found for %s %s — timeline unavailable.",
+                                        playerSpec.c_str(), playerClass.c_str());
+                }
+                else if (!root.contains("events") || !root["events"].is_array() || root["events"].empty()) {
+                    ImGui::TextDisabled("No cast events available for timeline.");
+                }
+                else {
+                    // ── Bucket timestamps by spell category ──────────────────────────────────
+                    // Build O(1) lookup sets from the hardcoded spell lists.
+                    auto makeSet = [](const std::vector<int>& v) {
+                        std::unordered_set<int> s(v.begin(), v.end());
+                        return s;
+                    };
+                    const auto rotSet  = makeSet(pwc->getRotSpells());
+                    const auto offSet  = makeSet(pwc->getOffSpells());
+                    const auto defSet  = makeSet(pwc->getDefSpells());
+                    const auto mobSet  = makeSet(pwc->getMobSpells());
+                    const auto utilSet = makeSet(pwc->getUtilSpells());
+
+                    std::vector<double> rotTs, offTs, defTs, mobTs, utilTs, unknownTs;
+
+                    double t0 = -1.0;
+                    for (const auto& ev : root["events"]) {
+                        // Only the selected player's own casts — skip pets, NPCs, other players.
+                        if (!ev.contains("sourceID")) continue;
+                        if (ev["sourceID"].get<int>() != g_debugPlayerId) continue;
+
+                        // Skip auto-attacks and WCL synthetic "fake" events.
+                        if (ev.value("melee", false)) continue;
+                        if (ev.value("fake",  false)) continue;
+
+                        const int  sid = ev.value("abilityGameID", 0);
+                        const double ts = ev.value("timestamp", 0.0);
+                        if (sid == 0 || sid == 1) continue;  // melee / null spells
+
+                        if (t0 < 0.0) t0 = ts;
+                        const double t = (ts - t0) / 1000.0;   // → seconds from first event
+
+                        if      (rotSet.count(sid))   rotTs.push_back(t);
+                        else if (offSet.count(sid))   offTs.push_back(t);
+                        else if (defSet.count(sid))   defTs.push_back(t);
+                        else if (mobSet.count(sid))   mobTs.push_back(t);
+                        else if (utilSet.count(sid))  utilTs.push_back(t);
+                        else                          unknownTs.push_back(t);  // cast by player but not in any list
+                    }
+
+                    // ── Multi-row scatter timeline (one horizontal track per category) ─────────
+                    //   Row Y values:   4 = Rotation, 3 = Offensive, 2 = Defensive,
+                    //                   1 = Mobility, 0 = Utility
+                    static const double kYTicks[]  = { 0.0, 1.0, 2.0, 3.0, 4.0 };
+                    static const char*  kYLabels[] = { "Utility", "Mobility", "Defensive", "Offensive", "Rotation" };
+
+                    if (ImPlot::BeginPlot("##CastTimeline", ImVec2(-1, 200),
+                                        ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend))
+                    {
+                        ImPlot::SetupAxes("Time (s)", nullptr,
+                                        ImPlotAxisFlags_None,
+                                        ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_NoTickMarks);
+                        ImPlot::SetupAxisTicks(ImAxis_Y1, kYTicks, 5, kYLabels);
+                        // Lock Y so rows never shift; X auto-fits to the fight duration.
+                        ImPlot::SetupAxisLimits(ImAxis_Y1, -0.6, 4.6, ImGuiCond_Always);
+
+                        // Each category is its own PlotScatter call so colours are independent.
+                        auto plotRow = [](const std::vector<double>& ts,
+                                        double                      rowY,
+                                        ImVec4                      col,
+                                        const char*                 id)
+                        {
+                            if (ts.empty()) return;
+                            std::vector<double> ys(ts.size(), rowY);
+                            //ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 5.0f, col, 1.0f, col);
+                            ImPlot::PlotScatter(id, ts.data(), ys.data(), static_cast<int>(ts.size()));
+                        };
+
+                        plotRow(rotTs,  4.0, ImVec4(1.00f, 0.35f, 0.35f, 1.0f), "##rot");   // red
+                        plotRow(offTs,  3.0, ImVec4(1.00f, 0.70f, 0.10f, 1.0f), "##off");   // orange
+                        plotRow(defTs,  2.0, ImVec4(0.30f, 0.70f, 1.00f, 1.0f), "##def");   // blue
+                        plotRow(mobTs,  1.0, ImVec4(0.40f, 1.00f, 0.40f, 1.0f), "##mob");   // green
+                        plotRow(utilTs, 0.0, ImVec4(0.90f, 0.60f, 1.00f, 1.0f), "##util");  // purple
+
+                        ImPlot::EndPlot();
+                    }
+
+                    // ── Cast-count summary bar below the timeline ─────────────────────────────
+                    ImGui::Spacing();
+                    ImGui::Columns(5, "##castCounts", true);
+
+                    struct CatSummary { const char* name; const std::vector<double>* ts; ImVec4 col; };
+                    const CatSummary kSummary[] = {
+                        { "Rotation",  &rotTs,  ImVec4(1.00f, 0.35f, 0.35f, 1.0f) },
+                        { "Offensive", &offTs,  ImVec4(1.00f, 0.70f, 0.10f, 1.0f) },
+                        { "Defensive", &defTs,  ImVec4(0.30f, 0.70f, 1.00f, 1.0f) },
+                        { "Mobility",  &mobTs,  ImVec4(0.40f, 1.00f, 0.40f, 1.0f) },
+                        { "Utility",   &utilTs, ImVec4(0.90f, 0.60f, 1.00f, 1.0f) },
+                    };
+                    for (auto& s : kSummary) {
+                        ImGui::TextColored(s.col, "%s", s.name);
+                        ImGui::Text("%d casts", static_cast<int>(s.ts->size()));
+                        ImGui::NextColumn();
+                    }
+                    ImGui::Columns(1);
+
+                    // ── Unmatched-cast disclosure (aids debugging missing spell IDs) ──────────
+                    if (!unknownTs.empty()) {
+                        ImGui::Spacing();
+                        ImGui::TextDisabled("(%d casts not matched to any spell list — check specData.h)",
+                                            static_cast<int>(unknownTs.size()));
+                    }
+                }
 
                 } catch (const json::exception& e) {
                     ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),

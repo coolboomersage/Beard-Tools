@@ -30,6 +30,17 @@ add_subdirectory(
     ${CMAKE_BINARY_DIR}/curl-build
 )
 
+# ---------------------- glfw --------------------------------------
+set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
+
+add_subdirectory(
+    ${CMAKE_SOURCE_DIR}/external/glfw-3.4
+    ${CMAKE_BINARY_DIR}/glfw-build
+)
+
 #---------------------- imgui ---------------------------------------
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/external/imgui-1.92.7)
 set(IMGUI_SOURCES
@@ -61,7 +72,7 @@ target_include_directories(BeardTools PRIVATE
 )
 
 target_link_libraries(BeardTools PRIVATE
-    ${CMAKE_SOURCE_DIR}/external/glfw-3.4/build/src/debug/glfw3.lib
+    glfw
     libcurl
     opengl32
 )
