@@ -41,10 +41,18 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
+#--------------------- imgplot --------------------------------------
+set(IMPLOT_DIR ${CMAKE_SOURCE_DIR}/external/implot-1.0)
+set(IMPLOT_SOURCES
+    ${IMPLOT_DIR}/implot.cpp
+    ${IMPLOT_DIR}/implot_items.cpp
+)
+
 # ----------------------- exe file -------------------------------------
-add_executable(BeardTools main.cpp ${IMGUI_SOURCES})
+add_executable(BeardTools main.cpp ${IMGUI_SOURCES} ${IMPLOT_SOURCES})
 
 target_include_directories(BeardTools PRIVATE
+    ${IMPLOT_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${CMAKE_SOURCE_DIR}/external/glfw-3.4/include

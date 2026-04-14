@@ -26,6 +26,8 @@
 #include "external/curl-8.19.0/include/curl/curl.h"
 #include "external/nlohmann/json.hpp"
 
+#include "imPlotWrapper.h"
+
 using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
@@ -545,9 +547,18 @@ int main(){
     // Initialize ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImPlot::CreateContext();
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
+
+    static const ImVec4 s_pieColors[] = {
+        ImVec4(1.0f, 0.4f, 0.4f, 1.0f), // Crit
+        ImVec4(0.4f, 1.0f, 0.4f, 1.0f), // Haste
+        ImVec4(0.4f, 0.8f, 1.0f, 1.0f), // Mastery
+        ImVec4(0.9f, 0.6f, 1.0f, 1.0f), // Versatility
+    };
+    ImPlotColormap g_secondariesColormap = ImPlot::AddColormap("secondaries color", s_pieColors, 4);
 
     FetchToken();
 
@@ -987,6 +998,35 @@ int main(){
 
                     ImGui::Spacing();
 
+                    // ── Secondary Stats Pie Chart ────────────────────────────────────────
+                    const char* labels[] = { "##0", "##1", "##2", "##3" };
+                    const char* keys[]   = { "Crit", "Haste", "Mastery", "Versatility" };
+
+                    double values[4] = {};
+                    for (int i = 0; i < 4; ++i) {
+                        if (stats.contains(keys[i]) && stats[keys[i]].contains("max"))
+                            values[i] = stats[keys[i]]["max"].get<int>();
+                    }
+
+                    ImPlot::PushColormap(g_secondariesColormap);
+
+                    if (ImPlot::BeginPlot("##PieChart", ImVec2(250, 250),
+                                        ImPlotFlags_Equal | ImPlotFlags_NoMouseText | ImPlotFlags_NoInputs | ImPlotFlags_NoLegend))
+                    {
+                        ImPlot::SetupAxes(nullptr, nullptr,
+                                        ImPlotAxisFlags_NoDecorations,
+                                        ImPlotAxisFlags_NoDecorations);
+
+                        ImPlot::PlotPieChart(labels, values, 4,
+                                            /*x=*/0.5, /*y=*/0.5, /*radius=*/0.4,
+                                            "%.0f");
+                        ImPlot::EndPlot();
+                    }
+
+                    ImPlot::PopColormap();
+
+                    ImGui::Spacing();
+
                     // ── Defensive Stats ──────────────────────────────────────────────────
                     ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Defensive Stats");
                     ImGui::Separator();
@@ -1021,6 +1061,7 @@ int main(){
     // Cleanup
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
     glfwDestroyWindow(window);
     glfwTerminate();
