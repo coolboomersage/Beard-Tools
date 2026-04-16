@@ -95,3 +95,68 @@ struct SpecEntry {
     const char*     spec;
     const WoWclass* wc;
 };
+
+// ---------------------------------------------------------------------------
+// structs to store player window information
+// ---------------------------------------------------------------------------
+struct GearSlot {
+    int         slot      = -1;
+    std::string name;
+    int         itemLevel = 0;
+    bool        isTier    = false;
+    bool        hasTrack  = false;
+    std::string trackName;
+    ImVec4      color      = ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
+    ImVec4      trackColor = ImVec4(1.0f,  1.0f,  1.0f,  1.0f);
+    bool        empty      = true;
+};
+
+struct BossRow {
+    std::string         name;
+    std::vector<double> ts;
+};
+
+struct PlayerWindowData {
+    // Identity
+    std::string playerName  = "Unknown";
+    std::string playerClass = "Unknown";
+    std::string playerSpec  = "Unknown";
+    std::string playerRole  = "Unknown";
+    float       ilvl        = 0.0f;
+
+    // Primary stats
+    int agility   = 0;
+    int strength  = 0;
+    int intellect = 0;
+    int stamina   = 0;
+
+    // Secondary stats
+    int    crit        = 0;
+    int    haste       = 0;
+    int    mastery     = 0;
+    int    versatility = 0;
+    double pieValues[4] = {};   // Crit, Haste, Mastery, Versatility
+
+    // Defensive stats
+    int armor     = 0;
+    int leech     = 0;
+    int avoidance = 0;
+    int speed     = 0;
+
+    // Gear (slots 0-17)
+    GearSlot gear[18];
+
+    // Timeline
+    bool                hasSpellData = false;
+    bool                hasEventData = false;
+    std::vector<double> rotTs, offTs, defTs, mobTs, utilTs;
+    int                 unknownCount = 0;
+    double              tMax         = 0.0;
+
+    // Boss timeline
+    std::vector<BossRow> bossRows;
+
+    // Error / status
+    bool        parseOk = false;
+    std::string parseError;
+};

@@ -16,8 +16,8 @@ extern std::atomic<bool> g_reportReady;
 
 // Cached after the first successful report fetch so player-button clicks
 // can re-use the same credentials without threading headaches.
-extern std::string g_cachedReportCode;
-extern std::string g_cachedBearerToken;
+extern std::string       g_cachedReportCode;
+extern std::string       g_cachedBearerToken;
 
 // ---------------------------------------------------------------------------
 // Per-player debug/detail window state
@@ -30,6 +30,13 @@ extern std::atomic<bool> g_debugFetching;
 extern std::string       g_debugWindowTitle;  // "PlayerName — FightName"
 extern std::string       g_debugRawResponse;  // verbatim server JSON
 extern int               g_debugPlayerId;
+inline std::string       g_cachedBossJson;
+// Module-level singletons — written once per fetch, read every frame.
+static PlayerWindowData  g_playerData;
+static bool              g_playerDataReady = false;
+// Edge-detect flag: set true when a player button is clicked,
+// cleared once BuildPlayerData() has run after the fetch completes.
+static bool              g_wasFetching     = false;
 
 // ---------------------------------------------------------------------------
 // Spec map — maps WCL class/spec strings to hardcoded WoWclass data.

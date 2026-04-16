@@ -19,6 +19,552 @@
 
 using json = nlohmann::json;
 
+// ── BuildPlayerData: parse raw JSON strings -> PlayerWindowData ────────────────
+// Called ONCE when g_debugFetching transitions false
+static PlayerWindowData BuildPlayerData(
+    const std::string& rawResponse,
+    int                playerId,
+    const std::string& bossJson)
+{
+    PlayerWindowData d;
+
+    // Upgrade-track colour helper (runs during build, not during render)
+    auto trackColor = [&](const json& item, ImVec4& outCol,
+                          std::string& outName) -> bool {
+        if (!item.contains("bonusIDs") || !item["bonusIDs"].is_array())
+            return false;
+        for (auto& bid : item["bonusIDs"]) {
+            if (!bid.is_number_integer()) continue;
+            int id = bid.get<int>();
+            for (auto& track : kUpgradeTracks) {
+                if (track.bonusID == id) {
+                    outCol  = track.color;
+                    outName = track.name;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    try {
+        auto root       = json::parse(rawResponse);
+        auto& tableData = root["table"]["data"];
+        auto& info      = tableData["combatantInfo"];
+        auto& stats     = info["stats"];
+
+        // ── Player identity ───────────────────────────────────────────────────
+        if (tableData.contains("composition") &&
+            tableData["composition"].is_array()) {
+            for (auto& member : tableData["composition"]) {
+                if (!member.contains("id") || !member["id"].is_number()) continue;
+                if (member["id"].get<int>() != playerId) continue;
+
+                d.playerName  = member.value("name", "Unknown");
+                d.playerClass = member.value("type",  "Unknown");
+
+                if (member.contains("specs") &&
+                    member["specs"].is_array() &&
+                    !member["specs"].empty()) {
+                    auto& spec   = member["specs"][0];
+                    d.playerSpec = spec.value("spec", "Unknown");
+                    d.playerRole = spec.value("role", "Unknown");
+                }
+                break;
+            }
+        }
+
+        d.ilvl = tableData.value("itemLevel", 0.0f);
+
+        // ── Stats ─────────────────────────────────────────────────────────────
+        auto getStat = [&](const char* key) -> int {
+            if (stats.contains(key) && stats[key].contains("max"))
+                return stats[key]["max"].get<int>();
+            return 0;
+        };
+
+        d.agility     = getStat("Agility");
+        d.strength    = getStat("Strength");
+        d.intellect   = getStat("Intellect");
+        d.stamina     = getStat("Stamina");
+        d.crit        = getStat("Crit");
+        d.haste       = getStat("Haste");
+        d.mastery     = getStat("Mastery");
+        d.versatility = getStat("Versatility");
+        d.armor       = getStat("Armor");
+        d.leech       = getStat("Leech");
+        d.avoidance   = getStat("Avoidance");
+        d.speed       = getStat("Speed");
+
+        d.pieValues[0] = d.crit;
+        d.pieValues[1] = d.haste;
+        d.pieValues[2] = d.mastery;
+        d.pieValues[3] = d.versatility;
+
+        // ── Gear ──────────────────────────────────────────────────────────────
+        if (info.contains("gear") && info["gear"].is_array()) {
+            // First pass: ilvl range for gradient colour
+            int minIlvl = INT_MAX, maxIlvl = 0;
+            for (auto& item : info["gear"]) {
+                if (item.value("id", 0) == 0) continue;
+                int il = item.value("itemLevel", 0);
+                if (il <= 1) continue;
+                if (il < minIlvl) minIlvl = il;
+                if (il > maxIlvl) maxIlvl = il;
+            }
+            bool allSame = (maxIlvl == 0) || (minIlvl == maxIlvl);
+
+            struct GradStop { float t, r, g, b; };
+            static constexpr GradStop kStops[] = {
+                { 0.00f, 1.0f, 1.0f,  1.0f  },
+                { 0.25f, 0.1f, 1.0f,  0.1f  },
+                { 0.50f, 0.3f, 0.5f,  1.0f  },
+                { 0.75f, 0.7f, 0.3f,  1.0f  },
+                { 1.00f, 1.0f, 0.85f, 0.0f  },
+            };
+
+            auto ilvlColor = [&](int il) -> ImVec4 {
+                if (il <= 1 || maxIlvl == 0)
+                    return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
+                float t = allSame ? 1.0f
+                    : std::clamp((float)(il - minIlvl) /
+                                 (float)(maxIlvl - minIlvl), 0.0f, 1.0f);
+                for (int i = 0; i < 4; ++i) {
+                    if (t <= kStops[i + 1].t) {
+                        float s = (t - kStops[i].t) /
+                                  (kStops[i + 1].t - kStops[i].t);
+                        return ImVec4(
+                            kStops[i].r + s*(kStops[i+1].r - kStops[i].r),
+                            kStops[i].g + s*(kStops[i+1].g - kStops[i].g),
+                            kStops[i].b + s*(kStops[i+1].b - kStops[i].b),
+                            1.0f);
+                    }
+                }
+                return ImVec4(kStops[4].r, kStops[4].g, kStops[4].b, 1.0f);
+            };
+
+            for (auto& item : info["gear"]) {
+                int s = item.value("slot", -1);
+                if (s < 0 || s >= 18) continue;
+
+                GearSlot& gs = d.gear[s];
+                gs.slot  = s;
+                gs.empty = (item.value("id", 0) == 0);
+
+                if (!gs.empty) {
+                    gs.name      = item.value("name", "Unknown");
+                    gs.itemLevel = item.value("itemLevel", 0);
+                    gs.isTier    = item.contains("setID");
+
+                    ImVec4      tc;
+                    std::string tname;
+                    gs.hasTrack = trackColor(item, tc, tname);
+                    if (gs.hasTrack) {
+                        gs.trackColor = tc;
+                        gs.trackName  = tname;
+                    }
+
+                    // Priority: tier > track > ilvl gradient
+                    if (gs.isTier)
+                        gs.color = ImVec4(1.0f, 0.2f, 0.2f, 1.0f);
+                    else if (gs.hasTrack)
+                        gs.color = tc;
+                    else
+                        gs.color = ilvlColor(gs.itemLevel);
+                }
+            }
+        }
+
+        // ── Spell cast timeline ───────────────────────────────────────────────
+        const WoWclass* pwc = nullptr;
+        for (auto& entry : kSpecMap) {
+            if (d.playerClass == entry.cls && d.playerSpec == entry.spec) {
+                pwc = entry.wc;
+                break;
+            }
+        }
+
+        d.hasSpellData = (pwc != nullptr);
+        d.hasEventData = root.contains("events") &&
+                         root["events"].is_array() &&
+                         !root["events"].empty();
+
+        if (d.hasSpellData && d.hasEventData) {
+            auto makeSet = [](const std::vector<int>& v) {
+                return std::unordered_set<int>(v.begin(), v.end());
+            };
+            const auto rotSet  = makeSet(pwc->getRotSpells());
+            const auto offSet  = makeSet(pwc->getOffSpells());
+            const auto defSet  = makeSet(pwc->getDefSpells());
+            const auto mobSet  = makeSet(pwc->getMobSpells());
+            const auto utilSet = makeSet(pwc->getUtilSpells());
+
+            int    unknownCnt = 0;
+            double t0         = -1.0;
+
+            for (const auto& ev : root["events"]) {
+                if (!ev.contains("sourceID")) continue;
+                if (ev["sourceID"].get<int>() != playerId) continue;
+                if (ev.value("melee", false)) continue;
+                if (ev.value("fake",  false)) continue;
+
+                const int    sid = ev.value("abilityGameID", 0);
+                const double ts  = ev.value("timestamp", 0.0);
+                if (sid == 0 || sid == 1) continue;
+
+                if (t0 < 0.0) t0 = ts;
+                const double t = (ts - t0) / 1000.0;
+                d.tMax = std::max(d.tMax, t);
+
+                if      (rotSet.count(sid))  d.rotTs.push_back(t);
+                else if (offSet.count(sid))  d.offTs.push_back(t);
+                else if (defSet.count(sid))  d.defTs.push_back(t);
+                else if (mobSet.count(sid))  d.mobTs.push_back(t);
+                else if (utilSet.count(sid)) d.utilTs.push_back(t);
+                else                         ++unknownCnt;
+            }
+            d.unknownCount = unknownCnt;
+
+            // ── Boss cast timeline ────────────────────────────────────────────
+            try {
+                json bj = json::parse(bossJson);
+                std::vector<std::string>                  bossOrder;
+                std::unordered_map<std::string, BossRow>  bossMap;
+
+                if (bj.contains("bosses")) {
+                    for (const auto& b : bj["bosses"]) {
+                        std::string name = b.value("name", "Unknown");
+                        if (bossMap.find(name) == bossMap.end()) {
+                            bossOrder.push_back(name);
+                            bossMap[name].name = name;
+                        }
+                    }
+                }
+                if (bj.contains("castTimeline")) {
+                    for (const auto& ev : bj["castTimeline"]) {
+                        std::string name = ev.value("bossName", "Unknown");
+                        double ts = ev.value("timestamp", 0.0);
+                        double t  = (t0 >= 0.0) ? (ts - t0) / 1000.0
+                                                 : ts / 1000.0;
+                        d.tMax = std::max(d.tMax, t);
+                        if (bossMap.find(name) != bossMap.end())
+                            bossMap[name].ts.push_back(t);
+                    }
+                }
+                for (const auto& name : bossOrder)
+                    d.bossRows.push_back(std::move(bossMap[name]));
+
+            } catch (const std::exception& e) {
+                std::cerr << "[Timeline] boss JSON parse error: "
+                          << e.what() << "\n";
+            }
+        }
+
+        d.parseOk = true;
+
+    } catch (const json::exception& e) {
+        d.parseOk    = false;
+        d.parseError = e.what();
+    }
+
+    return d;
+}
+
+// ── RenderPlayerWindow: pure display — reads g_playerData, writes nothing ─────
+static void RenderPlayerWindow(ImGuiIO& io,
+                               ImPlotColormap g_secondariesColormap)
+{
+    std::lock_guard<std::mutex> dlock(g_debugMutex);
+
+    ImGui::SetNextWindowSize(ImVec2(720, 600), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(
+        ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+        ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    ImGui::Begin(g_debugWindowTitle.c_str(), &g_debugWindowOpen);
+
+    if (g_debugFetching.load()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                           "Fetching from server...");
+        ImGui::End();
+        return;
+    }
+
+    if (!g_playerDataReady) {
+        ImGui::TextDisabled("No data loaded yet.");
+        ImGui::End();
+        return;
+    }
+
+    const PlayerWindowData& d = g_playerData;
+
+    if (!d.parseOk) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                           "JSON parse error: %s", d.parseError.c_str());
+        ImGui::End();
+        return;
+    }
+
+    // ── Name / Class / Spec banner ────────────────────────────────────────────
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f),
+                       "%s", d.playerName.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s %s  |  Role: %s)",
+                        d.playerSpec.c_str(),
+                        d.playerClass.c_str(),
+                        d.playerRole.c_str());
+    ImGui::Separator();
+
+    // ── Item level ────────────────────────────────────────────────────────────
+    ImGui::Text("Item Level");
+    ImGui::SameLine(160);
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "%.1f", d.ilvl);
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // Helper: print a single stat row
+    auto printStat = [](const char* label, int val, ImVec4 col) {
+        if (val == 0) return;
+        ImGui::Text("  %s", label);
+        ImGui::SameLine(160);
+        ImGui::TextColored(col, "%d", val);
+    };
+    static const ImVec4 kGold = ImVec4(1.0f, 0.75f, 0.2f, 1.0f);
+
+    // ── Primary stats ─────────────────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Primary Stats");
+    ImGui::Separator();
+    printStat("Agility",   d.agility,   kGold);
+    printStat("Strength",  d.strength,  kGold);
+    printStat("Intellect", d.intellect, kGold);
+    printStat("Stamina",   d.stamina,   kGold);
+    ImGui::Spacing();
+
+    // ── Secondary stats ───────────────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Secondary Stats");
+    ImGui::Separator();
+    printStat("Crit",        d.crit,        ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+    printStat("Haste",       d.haste,       ImVec4(0.4f, 1.0f, 0.4f, 1.0f));
+    printStat("Mastery",     d.mastery,     ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
+    printStat("Versatility", d.versatility, ImVec4(0.9f, 0.6f, 1.0f, 1.0f));
+    ImGui::Spacing();
+
+    // ── Pie chart ─────────────────────────────────────────────────────────────
+    {
+        static const char* kPieLabels[] = { "##0", "##1", "##2", "##3" };
+        ImPlot::PushColormap(g_secondariesColormap);
+        if (ImPlot::BeginPlot("##PieChart", ImVec2(250, 250),
+                              ImPlotFlags_Equal     |
+                              ImPlotFlags_NoMouseText |
+                              ImPlotFlags_NoInputs  |
+                              ImPlotFlags_NoLegend))
+        {
+            ImPlot::SetupAxes(nullptr, nullptr,
+                              ImPlotAxisFlags_NoDecorations,
+                              ImPlotAxisFlags_NoDecorations);
+            ImPlot::PlotPieChart(kPieLabels, d.pieValues, 4,
+                                 0.5, 0.5, 0.4, "%.0f");
+            ImPlot::EndPlot();
+        }
+        ImPlot::PopColormap();
+    }
+    ImGui::Spacing();
+
+    // ── Defensive stats ───────────────────────────────────────────────────────
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Defensive Stats");
+    ImGui::Separator();
+    printStat("Armor",     d.armor,     ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+    printStat("Leech",     d.leech,     ImVec4(0.6f, 1.0f, 0.6f, 1.0f));
+    printStat("Avoidance", d.avoidance, ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+    printStat("Speed",     d.speed,     ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // ── Equipped gear ─────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Equipped Gear");
+    ImGui::Separator();
+
+    static const char* kSlotLabel[18] = {
+        "Head",      "Neck",      "Shoulders", "Shirt",
+        "Chest",     "Waist",     "Legs",      "Feet",
+        "Wrists",    "Hands",     "Ring 1",    "Ring 2",
+        "Trinket 1", "Trinket 2", "Back",      "Main Hand",
+        "Off Hand",  "Ranged"
+    };
+
+    auto renderSlot = [&](int slot) {
+        if (slot < 0 || slot >= 18) return;
+        const char*     label = kSlotLabel[slot];
+        const GearSlot& gs    = d.gear[slot];
+
+        if (gs.empty || gs.slot == -1) {
+            ImGui::TextDisabled("  %-11s  —", label);
+            return;
+        }
+
+        ImGui::TextDisabled("  %-11s", label);
+        ImGui::SameLine();
+        ImGui::TextColored(gs.color, "%s - %d",
+                           gs.name.c_str(), gs.itemLevel);
+
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            if (gs.isTier) {
+                ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f),
+                                   "Tier / Set Piece");
+                if (gs.hasTrack)
+                    ImGui::TextColored(gs.trackColor,
+                                       "Upgrade: %s", gs.trackName.c_str());
+            } else if (gs.hasTrack) {
+                ImGui::TextColored(gs.trackColor,
+                                   "Track: %s", gs.trackName.c_str());
+            } else {
+                ImGui::TextDisabled("Track: Unknown (ilvl fallback)");
+            }
+            ImGui::EndTooltip();
+        }
+    };
+
+    static const int kLeftSlots[]  = { 0, 1, 2, 14, 4, 3, 8 };
+    static const int kRightSlots[] = { 9, 5, 6, 7, 10, 11, 12, 13 };
+
+    ImGui::Columns(2, "##gearCols", false);
+    for (int s : kLeftSlots)  renderSlot(s);
+    ImGui::NextColumn();
+    for (int s : kRightSlots) renderSlot(s);
+    ImGui::Columns(1);
+
+    ImGui::Separator();
+    renderSlot(15);  // Main Hand
+    renderSlot(16);  // Off Hand
+
+    // ── Spell cast timelines ──────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Spell Cast Timelines");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (!d.hasSpellData) {
+        ImGui::TextDisabled(
+            "No hardcoded spell data found for %s %s — timeline unavailable.",
+            d.playerSpec.c_str(), d.playerClass.c_str());
+    } else if (!d.hasEventData) {
+        ImGui::TextDisabled("No cast events available for timeline.");
+    } else {
+        const int kPlayerRows = 5;
+        const int kGap        = 1;
+        const int kBossBase   = kPlayerRows + kGap;
+        const int totalRows   = kBossBase + (int)d.bossRows.size();
+
+        const double yMin = -0.6;
+        const double yMax = (double)totalRows - 0.4;
+
+        // Build Y-axis tick data (stack-local; outlives the plot call below)
+        std::vector<double>      yTickVals;
+        std::vector<const char*> yTickLabels;
+        std::vector<std::string> bossLabelStorage;
+
+        static const double     kPlayerY[]      = { 0,1,2,3,4 };
+        static const char*      kPlayerLabels[] = {
+            "Utility","Mobility","Defensive","Offensive","Rotation"
+        };
+        for (int i = 0; i < kPlayerRows; ++i) {
+            yTickVals.push_back(kPlayerY[i]);
+            yTickLabels.push_back(kPlayerLabels[i]);
+        }
+        yTickVals.push_back((double)kPlayerRows);
+        yTickLabels.push_back("");
+
+        bossLabelStorage.reserve(d.bossRows.size());
+        for (int i = 0; i < (int)d.bossRows.size(); ++i) {
+            bossLabelStorage.push_back(d.bossRows[i].name);
+            yTickVals.push_back((double)(kBossBase + i));
+            yTickLabels.push_back(bossLabelStorage.back().c_str());
+        }
+
+        const float plotHeight = 28.0f * (float)totalRows;
+
+        if (ImPlot::BeginPlot("##CastTimeline",
+                              ImVec2(-1, plotHeight),
+                              ImPlotFlags_NoMouseText |
+                              ImPlotFlags_NoLegend))
+        {
+            ImPlot::SetupAxes("Time (s)", nullptr,
+                              ImPlotAxisFlags_None,
+                              ImPlotAxisFlags_NoGridLines |
+                              ImPlotAxisFlags_NoTickMarks);
+            ImPlot::SetupAxisTicks(ImAxis_Y1,
+                                   yTickVals.data(),
+                                   (int)yTickVals.size(),
+                                   yTickLabels.data());
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0,
+                                    d.tMax > 0.0 ? d.tMax * 1.05 : 60.0,
+                                    ImGuiCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax,
+                                    ImGuiCond_Always);
+
+            auto plotRow = [](const std::vector<double>& ts,
+                              double rowY, const char* id) {
+                if (ts.empty()) return;
+                std::vector<double> ys(ts.size(), rowY);
+                ImPlot::PlotScatter(id, ts.data(), ys.data(),
+                                    (int)ts.size());
+            };
+
+            plotRow(d.rotTs,  4.0, "##rot");
+            plotRow(d.offTs,  3.0, "##off");
+            plotRow(d.defTs,  2.0, "##def");
+            plotRow(d.mobTs,  1.0, "##mob");
+            plotRow(d.utilTs, 0.0, "##util");
+
+            for (int i = 0; i < (int)d.bossRows.size(); ++i) {
+                std::string id = "##boss" + std::to_string(i);
+                plotRow(d.bossRows[i].ts,
+                        (double)(kBossBase + i),
+                        id.c_str());
+            }
+
+            ImPlot::EndPlot();
+        }
+
+        // ── Cast-count summary ────────────────────────────────────────────────
+        ImGui::Spacing();
+        ImGui::Columns(5, "##castCounts", true);
+
+        struct CatSummary {
+            const char*              name;
+            const std::vector<double>* ts;
+            ImVec4                   col;
+        };
+        const CatSummary kSummary[] = {
+            { "Rotation",  &d.rotTs,  ImVec4(1.00f,0.35f,0.35f,1.0f) },
+            { "Offensive", &d.offTs,  ImVec4(1.00f,0.70f,0.10f,1.0f) },
+            { "Defensive", &d.defTs,  ImVec4(0.30f,0.70f,1.00f,1.0f) },
+            { "Mobility",  &d.mobTs,  ImVec4(0.40f,1.00f,0.40f,1.0f) },
+            { "Utility",   &d.utilTs, ImVec4(0.90f,0.60f,1.00f,1.0f) },
+        };
+        for (auto& s : kSummary) {
+            ImGui::TextColored(s.col, "%s", s.name);
+            ImGui::Text("%d casts", (int)s.ts->size());
+            ImGui::NextColumn();
+        }
+        ImGui::Columns(1);
+
+        if (d.unknownCount > 0) {
+            ImGui::Spacing();
+            ImGui::TextDisabled(
+                "(%d casts not matched to any spell list — check specData.h)",
+                d.unknownCount);
+        }
+    }
+
+    ImGui::End();
+}
+
 int main() {
     static std::string       tokenResponse;
     static bool              tokenFetched = false;
@@ -74,7 +620,8 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    GLFWwindow* window = glfwCreateWindow(960, 400, "Beard Tools", nullptr, nullptr);
+    GLFWwindow* window =
+        glfwCreateWindow(960, 400, "Beard Tools", nullptr, nullptr);
     if (!window) { glfwTerminate(); return -1; }
 
     glfwMakeContextCurrent(window);
@@ -87,12 +634,11 @@ int main() {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    // Pie-chart colormap for secondary stats
     static const ImVec4 s_pieColors[] = {
-        ImVec4(1.0f, 0.4f, 0.4f, 1.0f),   // Crit
-        ImVec4(0.4f, 1.0f, 0.4f, 1.0f),   // Haste
-        ImVec4(0.4f, 0.8f, 1.0f, 1.0f),   // Mastery
-        ImVec4(0.9f, 0.6f, 1.0f, 1.0f),   // Versatility
+        ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+        ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+        ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+        ImVec4(0.9f, 0.6f, 1.0f, 1.0f),
     };
     ImPlotColormap g_secondariesColormap =
         ImPlot::AddColormap("secondaries color", s_pieColors, 4);
@@ -174,11 +720,11 @@ int main() {
                                     rep["owner"].contains("name"))
                                      ? rep["owner"]["name"].get<std::string>() : "";
 
-                    // ── Build id -> {name, role} lookup from playerDetails ──────
                     struct PlayerInfo { std::string name; std::string role; };
                     std::unordered_map<int, PlayerInfo> playerLookup;
 
-                    if (rep.contains("playerDetails") && !rep["playerDetails"].is_null()) {
+                    if (rep.contains("playerDetails") &&
+                        !rep["playerDetails"].is_null()) {
                         json pd = rep["playerDetails"].is_string()
                                     ? json::parse(rep["playerDetails"].get<std::string>())
                                     : rep["playerDetails"];
@@ -205,7 +751,6 @@ int main() {
                         }
                     }
 
-                    // ── Parse fights ──────────────────────────────────────────────
                     if (!rep.contains("fights") || !rep["fights"].is_array()) {
                         fetchStatus = "No fights data in response";
                         isFetching  = false;
@@ -218,13 +763,13 @@ int main() {
                         if (!f.contains("difficulty") || f["difficulty"].is_null()) continue;
 
                         Fight fight;
-                        fight.id        = (f.contains("id")        && f["id"].is_number())
+                        fight.id        = (f.contains("id") && f["id"].is_number())
                                           ? f["id"].get<int>()           : 0;
-                        fight.name      = (f.contains("name")      && f["name"].is_string())
+                        fight.name      = (f.contains("name") && f["name"].is_string())
                                           ? f["name"].get<std::string>() : "";
                         fight.startTime = (f.contains("startTime") && f["startTime"].is_number())
                                           ? f["startTime"].get<double>() : 0.0;
-                        fight.endTime   = (f.contains("endTime")   && f["endTime"].is_number())
+                        fight.endTime   = (f.contains("endTime") && f["endTime"].is_number())
                                           ? f["endTime"].get<double>()   : 0.0;
                         fight.percent   = (f.contains("bossPercentage") &&
                                            f["bossPercentage"].is_number())
@@ -314,16 +859,14 @@ int main() {
                 return            ImVec4(0.75f, 0.20f, 0.20f, 1.0f);
             };
 
-            // Renders a row of player buttons; fires a background fetch on click.
             auto renderPlayerButtons = [&](
                 const std::vector<PlayerEntry>& players,
                 const Fight&                    fight,
                 const char*                     roleTag,
                 int                             wrapAfter)
             {
-                bool fetching = g_debugFetching.load();
-                g_fetchedBossData = false;
-                g_currentFight    = fight;
+                bool fetching  = g_debugFetching.load();
+                g_currentFight = fight;
 
                 for (int i = 0; i < (int)players.size(); ++i) {
                     const PlayerEntry& pe = players[i];
@@ -337,31 +880,49 @@ int main() {
                     if (wasDisabled) ImGui::BeginDisabled();
 
                     if (ImGui::Button(btnId.c_str())) {
-                        Fight       capturedFight = fight;
-                        std::string capturedName  = pe.name;
-                        std::string capturedFightN= fight.name;
-                        int         capturedPid   = pe.id;
-                        std::string capturedCode  = g_cachedReportCode;
-                        std::string capturedToken = g_cachedBearerToken;
+                        Fight       capturedFight  = fight;
+                        std::string capturedName   = pe.name;
+                        std::string capturedFightN = fight.name;
+                        int         capturedPid    = pe.id;
+                        std::string capturedCode   = g_cachedReportCode;
+                        std::string capturedToken  = g_cachedBearerToken;
 
                         {
                             std::lock_guard<std::mutex> dlock(g_debugMutex);
-                            g_debugWindowTitle = capturedName + " \xe2\x80\x94 " + capturedFightN;
+                            g_debugWindowTitle = capturedName
+                                              + " \xe2\x80\x94 " + capturedFightN;
                             g_debugRawResponse = "Fetching\xe2\x80\xa6";
                             g_debugWindowOpen  = true;
                             g_debugPlayerId    = capturedPid;
                         }
-                        g_debugFetching = true;
-                        fetching        = true;
+
+                        // Mark that we need to (re)build the cached data
+                        // once the background thread finishes.
+                        g_playerDataReady = false;
+                        g_wasFetching     = true;
+                        g_debugFetching   = true;
+                        fetching          = true;
 
                         std::thread([capturedFight, capturedPid,
                                      capturedCode, capturedToken]() {
                             std::string raw = fetchPersonalFightData(
-                                capturedFight, capturedPid, capturedCode, capturedToken);
+                                capturedFight, capturedPid,
+                                capturedCode, capturedToken);
                             {
                                 std::lock_guard<std::mutex> dlock(g_debugMutex);
                                 g_debugRawResponse = raw;
                             }
+
+                            if (!g_fetchedBossData) {
+                                std::string bossJson = fetchBossCastTimeline(
+                                    capturedFight, capturedCode, capturedToken);
+                                {
+                                    std::lock_guard<std::mutex> dlock(g_debugMutex);
+                                    g_cachedBossJson = bossJson;
+                                }
+                                g_fetchedBossData = true;
+                            }
+
                             g_debugFetching = false;
                         }).detach();
                     }
@@ -394,9 +955,12 @@ int main() {
                          diffLabel(fight.difficulty),
                          mins, secs, killStr, percentStr);
 
-                ImGui::PushStyleColor(ImGuiCol_Header,        headerColor(fight.kill));
-                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, headerColorHov(fight.kill));
-                ImGui::PushStyleColor(ImGuiCol_HeaderActive,  headerColorAct(fight.kill));
+                ImGui::PushStyleColor(ImGuiCol_Header,
+                                      headerColor(fight.kill));
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
+                                      headerColorHov(fight.kill));
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive,
+                                      headerColorAct(fight.kill));
 
                 if (ImGui::CollapsingHeader(label)) {
                     ImGui::Indent(16.0f);
@@ -422,7 +986,9 @@ int main() {
                         ImGui::NewLine();
                         ImGui::Spacing();
                     }
-                    if (fight.tanks.empty() && fight.healers.empty() && fight.dps.empty())
+                    if (fight.tanks.empty() &&
+                        fight.healers.empty() &&
+                        fight.dps.empty())
                         ImGui::TextDisabled("No player data available.");
 
                     ImGui::Unindent(16.0f);
@@ -437,536 +1003,32 @@ int main() {
 
         ImGui::End();
 
-        // ── Per-player detail window ──────────────────────────────────────────
-        if (g_debugWindowOpen) {
-            std::lock_guard<std::mutex> dlock(g_debugMutex);
+        // ── Edge-detect: g_debugFetching just went false → parse ONCE ─────────
+        //
+        // g_wasFetching is set to true when a player button is clicked.
+        // The background thread sets g_debugFetching = false when done.
+        // We catch that falling edge here on the main thread, outside any
+        // ImGui Begin/End pair, so it runs exactly once per player request.
+        if (g_wasFetching && !g_debugFetching.load()) {
+            g_wasFetching = false;
 
-            ImGui::SetNextWindowSize(ImVec2(720, 600), ImGuiCond_Appearing);
-            ImGui::SetNextWindowPos(
-                ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-
-            ImGui::Begin(g_debugWindowTitle.c_str(), &g_debugWindowOpen);
-
-            if (g_debugFetching.load()) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
-                                   "Fetching from server...");
-            } else {
-                try {
-                    auto root       = json::parse(g_debugRawResponse);
-                    auto& tableData = root["table"]["data"];
-                    auto& info      = tableData["combatantInfo"];
-                    auto& stats     = info["stats"];
-
-                    // ── Resolve player identity from composition ───────────────
-                    std::string playerName  = "Unknown";
-                    std::string playerClass = "Unknown";
-                    std::string playerSpec  = "Unknown";
-                    std::string playerRole  = "Unknown";
-
-                    if (tableData.contains("composition") &&
-                        tableData["composition"].is_array()) {
-                        for (auto& member : tableData["composition"]) {
-                            if (!member.contains("id") ||
-                                !member["id"].is_number()) continue;
-                            if (member["id"].get<int>() != g_debugPlayerId) continue;
-
-                            playerName  = member.value("name", "Unknown");
-                            playerClass = member.value("type", "Unknown");
-
-                            if (member.contains("specs") &&
-                                member["specs"].is_array() &&
-                                !member["specs"].empty()) {
-                                auto& spec = member["specs"][0];
-                                playerSpec = spec.value("spec", "Unknown");
-                                playerRole = spec.value("role", "Unknown");
-                            }
-                            break;
-                        }
-                    }
-
-                    float ilvl = tableData.value("itemLevel", 0.0f);
-
-                    // ── Name / Class / Spec banner ────────────────────────────
-                    ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f),
-                                       "%s", playerName.c_str());
-                    ImGui::SameLine();
-                    ImGui::TextDisabled("(%s %s  |  Role: %s)",
-                                        playerSpec.c_str(),
-                                        playerClass.c_str(),
-                                        playerRole.c_str());
-                    ImGui::Separator();
-
-                    // ── Item level ────────────────────────────────────────────
-                    ImGui::Text("Item Level");
-                    ImGui::SameLine(160);
-                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "%.1f", ilvl);
-                    ImGui::Spacing();
-                    ImGui::Separator();
-
-                    // ── Primary stats ─────────────────────────────────────────
-                    auto printStat = [&](const char* label, const char* key,
-                                         ImVec4 col = ImVec4(1, 1, 1, 1)) {
-                        if (stats.contains(key) && stats[key].contains("max")) {
-                            int val = stats[key]["max"].get<int>();
-                            ImGui::Text("  %s", label);
-                            ImGui::SameLine(160);
-                            ImGui::TextColored(col, "%d", val);
-                        }
-                    };
-
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Primary Stats");
-                    ImGui::Separator();
-                    printStat("Agility",   "Agility",   ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
-                    printStat("Strength",  "Strength",  ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
-                    printStat("Intellect", "Intellect", ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
-                    printStat("Stamina",   "Stamina",   ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
-                    ImGui::Spacing();
-
-                    // ── Secondary stats ───────────────────────────────────────
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Secondary Stats");
-                    ImGui::Separator();
-                    printStat("Crit",        "Crit",        ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
-                    printStat("Haste",       "Haste",       ImVec4(0.4f, 1.0f, 0.4f, 1.0f));
-                    printStat("Mastery",     "Mastery",     ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
-                    printStat("Versatility", "Versatility", ImVec4(0.9f, 0.6f, 1.0f, 1.0f));
-                    ImGui::Spacing();
-
-                    // ── Secondary stats pie chart ─────────────────────────────
-                    const char* labels[] = { "##0", "##1", "##2", "##3" };
-                    const char* keys[]   = { "Crit", "Haste", "Mastery", "Versatility" };
-                    double values[4]     = {};
-                    for (int i = 0; i < 4; ++i) {
-                        if (stats.contains(keys[i]) && stats[keys[i]].contains("max"))
-                            values[i] = stats[keys[i]]["max"].get<int>();
-                    }
-
-                    ImPlot::PushColormap(g_secondariesColormap);
-                    if (ImPlot::BeginPlot("##PieChart", ImVec2(250, 250),
-                                          ImPlotFlags_Equal     |
-                                          ImPlotFlags_NoMouseText |
-                                          ImPlotFlags_NoInputs  |
-                                          ImPlotFlags_NoLegend))
-                    {
-                        ImPlot::SetupAxes(nullptr, nullptr,
-                                          ImPlotAxisFlags_NoDecorations,
-                                          ImPlotAxisFlags_NoDecorations);
-                        ImPlot::PlotPieChart(labels, values, 4,
-                                             0.5, 0.5, 0.4, "%.0f");
-                        ImPlot::EndPlot();
-                    }
-                    ImPlot::PopColormap();
-                    ImGui::Spacing();
-
-                    // ── Defensive stats ───────────────────────────────────────
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Defensive Stats");
-                    ImGui::Separator();
-                    printStat("Armor",     "Armor",     ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
-                    printStat("Leech",     "Leech",     ImVec4(0.6f, 1.0f, 0.6f, 1.0f));
-                    printStat("Avoidance", "Avoidance", ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
-                    printStat("Speed",     "Speed",     ImVec4(0.8f, 0.8f, 0.8f, 1.0f));
-                    ImGui::Spacing();
-                    ImGui::Separator();
-
-                    // ── Equipped gear ─────────────────────────────────────────
-                    ImGui::Spacing();
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "Equipped Gear");
-                    ImGui::Separator();
-
-                    if (info.contains("gear") && info["gear"].is_array()) {
-                        auto& gear = info["gear"];
-
-                        // Resolve upgrade track colour for a single item.
-                        auto trackColor = [&](const json& item, ImVec4& out) -> bool {
-                            if (!item.contains("bonusIDs") ||
-                                !item["bonusIDs"].is_array()) return false;
-                            for (auto& bid : item["bonusIDs"]) {
-                                if (!bid.is_number_integer()) continue;
-                                int id = bid.get<int>();
-                                for (auto& track : kUpgradeTracks) {
-                                    if (track.bonusID == id) {
-                                        out = track.color;
-                                        return true;
-                                    }
-                                }
-                            }
-                            return false;
-                        };
-
-                        // ilvl gradient fallback
-                        int minIlvl = INT_MAX, maxIlvl = 0;
-                        for (auto& item : gear) {
-                            if (item.value("id", 0) == 0) continue;
-                            int ilvl = item.value("itemLevel", 0);
-                            if (ilvl <= 1) continue;
-                            if (ilvl < minIlvl) minIlvl = ilvl;
-                            if (ilvl > maxIlvl) maxIlvl = ilvl;
-                        }
-                        bool allSame = (maxIlvl == 0) || (minIlvl == maxIlvl);
-
-                        struct GradStop { float t, r, g, b; };
-                        static constexpr GradStop kStops[] = {
-                            { 0.00f, 1.0f, 1.0f,  1.0f  },
-                            { 0.25f, 0.1f, 1.0f,  0.1f  },
-                            { 0.50f, 0.3f, 0.5f,  1.0f  },
-                            { 0.75f, 0.7f, 0.3f,  1.0f  },
-                            { 1.00f, 1.0f, 0.85f, 0.0f  },
-                        };
-
-                        auto ilvlColor = [&](int ilvl) -> ImVec4 {
-                            if (ilvl <= 1 || maxIlvl == 0)
-                                return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
-                            float t = allSame ? 1.0f
-                                : std::clamp((float)(ilvl - minIlvl) /
-                                             (float)(maxIlvl - minIlvl),
-                                             0.0f, 1.0f);
-                            for (int i = 0; i < 4; ++i) {
-                                if (t <= kStops[i + 1].t) {
-                                    float s = (t - kStops[i].t) /
-                                              (kStops[i + 1].t - kStops[i].t);
-                                    return ImVec4(
-                                        kStops[i].r + s*(kStops[i+1].r - kStops[i].r),
-                                        kStops[i].g + s*(kStops[i+1].g - kStops[i].g),
-                                        kStops[i].b + s*(kStops[i+1].b - kStops[i].b),
-                                        1.0f);
-                                }
-                            }
-                            return ImVec4(kStops[4].r, kStops[4].g, kStops[4].b, 1.0f);
-                        };
-
-                        // Priority: tier red > upgrade track > ilvl gradient
-                        auto resolveColor = [&](const json& item) -> ImVec4 {
-                            if (item.value("id", 0) == 0)
-                                return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
-                            if (item.contains("setID"))
-                                return ImVec4(1.0f, 0.2f, 0.2f, 1.0f);
-                            ImVec4 tc;
-                            if (trackColor(item, tc)) return tc;
-                            return ilvlColor(item.value("itemLevel", 0));
-                        };
-
-                        static const char* kSlotLabel[18] = {
-                            "Head",      "Neck",      "Shoulders", "Shirt",
-                            "Chest",     "Waist",     "Legs",      "Feet",
-                            "Wrists",    "Hands",     "Ring 1",    "Ring 2",
-                            "Trinket 1", "Trinket 2", "Back",      "Main Hand",
-                            "Off Hand",  "Ranged"
-                        };
-
-                        std::map<int, const json*> slotMap;
-                        for (auto& item : gear) {
-                            int s = item.value("slot", -1);
-                            if (s >= 0 && s < 18) slotMap[s] = &item;
-                        }
-
-                        auto renderSlot = [&](int slot) {
-                            const char* label =
-                                (slot >= 0 && slot < 18) ? kSlotLabel[slot] : "?";
-                            auto it = slotMap.find(slot);
-
-                            if (it == slotMap.end() ||
-                                it->second->value("id", 0) == 0) {
-                                ImGui::TextDisabled("  %-11s  —", label);
-                                return;
-                            }
-
-                            auto& item = *it->second;
-                            auto  name = item.value("name", "Unknown");
-                            int   ilvl = item.value("itemLevel", 0);
-
-                            ImGui::TextDisabled("  %-11s", label);
-                            ImGui::SameLine();
-                            ImGui::TextColored(resolveColor(item),
-                                               "%s - %d", name.c_str(), ilvl);
-
-                            if (ImGui::IsItemHovered()) {
-                                ImGui::BeginTooltip();
-                                ImVec4 trackCol;
-                                if (item.contains("setID")) {
-                                    ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f),
-                                                       "Tier / Set Piece");
-                                    for (auto& track : kUpgradeTracks) {
-                                        bool matched =
-                                            item.contains("bonusIDs") &&
-                                            item["bonusIDs"].end() !=
-                                            std::find_if(
-                                                item["bonusIDs"].begin(),
-                                                item["bonusIDs"].end(),
-                                                [&](const json& b) {
-                                                    return b.is_number_integer() &&
-                                                           b.get<int>() == track.bonusID;
-                                                });
-                                        if (matched) {
-                                            ImGui::TextColored(track.color,
-                                                "Upgrade: %s", track.name);
-                                            break;
-                                        }
-                                    }
-                                } else if (trackColor(item, trackCol)) {
-                                    for (auto& track : kUpgradeTracks) {
-                                        bool matched =
-                                            item.contains("bonusIDs") &&
-                                            item["bonusIDs"].end() !=
-                                            std::find_if(
-                                                item["bonusIDs"].begin(),
-                                                item["bonusIDs"].end(),
-                                                [&](const json& b) {
-                                                    return b.is_number_integer() &&
-                                                           b.get<int>() == track.bonusID;
-                                                });
-                                        if (matched) {
-                                            ImGui::TextColored(trackCol,
-                                                "Track: %s", track.name);
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    ImGui::TextDisabled("Track: Unknown (ilvl fallback)");
-                                }
-                                ImGui::EndTooltip();
-                            }
-                        };
-
-                        static const int kLeftSlots[]  = { 0, 1, 2, 14, 4, 3, 8 };
-                        static const int kRightSlots[] = { 9, 5, 6, 7, 10, 11, 12, 13 };
-
-                        ImGui::Columns(2, "##gearCols", false);
-                        for (int s : kLeftSlots)  renderSlot(s);
-                        ImGui::NextColumn();
-                        for (int s : kRightSlots) renderSlot(s);
-                        ImGui::Columns(1);
-
-                        ImGui::Separator();
-                        renderSlot(15);  // Main Hand
-                        renderSlot(16);  // Off Hand
-                    }
-
-                    // ── Spell cast timelines ──────────────────────────────────
-                    ImGui::Spacing();
-                    ImGui::Separator();
-                    ImGui::Spacing();
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f),
-                                       "Spell Cast Timelines");
-                    ImGui::Separator();
-                    ImGui::Spacing();
-
-                    const WoWclass* pwc = nullptr;
-                    for (auto& entry : kSpecMap) {
-                        if (playerClass == entry.cls && playerSpec == entry.spec) {
-                            pwc = entry.wc;
-                            break;
-                        }
-                    }
-
-                    if (!pwc) {
-                        ImGui::TextDisabled(
-                            "No hardcoded spell data found for %s %s"
-                            " — timeline unavailable.",
-                            playerSpec.c_str(), playerClass.c_str());
-                    } else if (!root.contains("events") ||
-                               !root["events"].is_array() ||
-                               root["events"].empty()) {
-                        ImGui::TextDisabled("No cast events available for timeline.");
-                    } else {
-                        auto makeSet = [](const std::vector<int>& v) {
-                            std::unordered_set<int> s(v.begin(), v.end());
-                            return s;
-                        };
-                        const auto rotSet  = makeSet(pwc->getRotSpells());
-                        const auto offSet  = makeSet(pwc->getOffSpells());
-                        const auto defSet  = makeSet(pwc->getDefSpells());
-                        const auto mobSet  = makeSet(pwc->getMobSpells());
-                        const auto utilSet = makeSet(pwc->getUtilSpells());
-
-                        std::vector<double> rotTs, offTs, defTs, mobTs, utilTs, unknownTs;
-
-                        double t0 = -1.0, tMax = 0.0;
-                        for (const auto& ev : root["events"]) {
-                            if (!ev.contains("sourceID")) continue;
-                            if (ev["sourceID"].get<int>() != g_debugPlayerId) continue;
-                            if (ev.value("melee", false)) continue;
-                            if (ev.value("fake",  false)) continue;
-
-                            const int    sid = ev.value("abilityGameID", 0);
-                            const double ts  = ev.value("timestamp", 0.0);
-                            if (sid == 0 || sid == 1) continue;
-
-                            if (t0 < 0.0) t0 = ts;
-                            const double t = (ts - t0) / 1000.0;
-                            tMax = std::max(tMax, t);
-
-                            if      (rotSet.count(sid))  rotTs.push_back(t);
-                            else if (offSet.count(sid))  offTs.push_back(t);
-                            else if (defSet.count(sid))  defTs.push_back(t);
-                            else if (mobSet.count(sid))  mobTs.push_back(t);
-                            else if (utilSet.count(sid)) utilTs.push_back(t);
-                            else                         unknownTs.push_back(t);
-                        }
-
-                        // ── Boss cast timeline ────────────────────────────────
-                        struct BossRow { std::string name; std::vector<double> ts; };
-                        std::vector<BossRow> bossRows;
-
-                        {
-                            std::string bossJson;
-                            if (!g_fetchedBossData) {
-                                bossJson = fetchBossCastTimeline(
-                                    g_currentFight, g_cachedReportCode,
-                                    g_cachedBearerToken);
-                            }
-                            g_fetchedBossData = true;
-
-                            try {
-                                json bj = json::parse(bossJson);
-                                std::vector<std::string> bossOrder;
-                                std::unordered_map<std::string, BossRow> bossMap;
-
-                                if (bj.contains("bosses")) {
-                                    for (const auto& b : bj["bosses"]) {
-                                        std::string name = b.value("name", "Unknown");
-                                        if (bossMap.find(name) == bossMap.end()) {
-                                            bossOrder.push_back(name);
-                                            bossMap[name].name = name;
-                                        }
-                                    }
-                                }
-                                if (bj.contains("castTimeline")) {
-                                    for (const auto& ev : bj["castTimeline"]) {
-                                        std::string name = ev.value("bossName", "Unknown");
-                                        double ts = ev.value("timestamp", 0.0);
-                                        double t  = (t0 >= 0.0)
-                                                     ? (ts - t0) / 1000.0
-                                                     : ts / 1000.0;
-                                        tMax = std::max(tMax, t);
-                                        if (bossMap.find(name) != bossMap.end())
-                                            bossMap[name].ts.push_back(t);
-                                    }
-                                }
-                                for (const auto& name : bossOrder)
-                                    bossRows.push_back(std::move(bossMap[name]));
-                            } catch (const std::exception& e) {
-                                std::cerr << "[Timeline] boss JSON parse error: "
-                                          << e.what() << "\n";
-                            }
-                        }
-
-                        // ── Y-axis layout ─────────────────────────────────────
-                        const int kPlayerRows = 5;
-                        const int kGap        = 1;
-                        const int kBossBase   = kPlayerRows + kGap;
-                        const int totalRows   = kBossBase + (int)bossRows.size();
-
-                        const double yMin = -0.6;
-                        const double yMax = (double)totalRows - 0.4;
-
-                        std::vector<double>      yTickVals;
-                        std::vector<const char*> yTickLabels;
-                        std::vector<std::string> bossLabelStorage;
-
-                        static const double     kPlayerY[]      = { 0,1,2,3,4 };
-                        static const char*      kPlayerLabels[] = {
-                            "Utility","Mobility","Defensive","Offensive","Rotation"
-                        };
-                        for (int i = 0; i < kPlayerRows; ++i) {
-                            yTickVals.push_back(kPlayerY[i]);
-                            yTickLabels.push_back(kPlayerLabels[i]);
-                        }
-                        yTickVals.push_back((double)kPlayerRows);
-                        yTickLabels.push_back("");
-
-                        bossLabelStorage.reserve(bossRows.size());
-                        for (int i = 0; i < (int)bossRows.size(); ++i) {
-                            bossLabelStorage.push_back(bossRows[i].name);
-                            yTickVals.push_back((double)(kBossBase + i));
-                            yTickLabels.push_back(bossLabelStorage.back().c_str());
-                        }
-
-                        const float plotHeight = 28.0f * (float)totalRows;
-
-                        if (ImPlot::BeginPlot("##CastTimeline",
-                                              ImVec2(-1, plotHeight),
-                                              ImPlotFlags_NoMouseText |
-                                              ImPlotFlags_NoLegend))
-                        {
-                            ImPlot::SetupAxes("Time (s)", nullptr,
-                                              ImPlotAxisFlags_None,
-                                              ImPlotAxisFlags_NoGridLines |
-                                              ImPlotAxisFlags_NoTickMarks);
-                            ImPlot::SetupAxisTicks(ImAxis_Y1,
-                                                   yTickVals.data(),
-                                                   (int)yTickVals.size(),
-                                                   yTickLabels.data());
-                            ImPlot::SetupAxisLimits(ImAxis_X1, 0.0,
-                                                    tMax > 0.0 ? tMax * 1.05 : 60.0,
-                                                    ImGuiCond_Always);
-                            ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax,
-                                                    ImGuiCond_Always);
-
-                            auto plotRow = [](const std::vector<double>& ts,
-                                              double rowY, const char* id) {
-                                if (ts.empty()) return;
-                                std::vector<double> ys(ts.size(), rowY);
-                                ImPlot::PlotScatter(id, ts.data(), ys.data(),
-                                                    (int)ts.size());
-                            };
-
-                            plotRow(rotTs,  4.0, "##rot");
-                            plotRow(offTs,  3.0, "##off");
-                            plotRow(defTs,  2.0, "##def");
-                            plotRow(mobTs,  1.0, "##mob");
-                            plotRow(utilTs, 0.0, "##util");
-
-                            for (int i = 0; i < (int)bossRows.size(); ++i) {
-                                std::string id = "##boss" + std::to_string(i);
-                                plotRow(bossRows[i].ts,
-                                        (double)(kBossBase + i),
-                                        id.c_str());
-                            }
-
-                            ImPlot::EndPlot();
-                        }
-
-                        // ── Cast-count summary ────────────────────────────────
-                        ImGui::Spacing();
-                        ImGui::Columns(5, "##castCounts", true);
-
-                        struct CatSummary {
-                            const char*              name;
-                            const std::vector<double>* ts;
-                            ImVec4                   col;
-                        };
-                        const CatSummary kSummary[] = {
-                            { "Rotation",  &rotTs,  ImVec4(1.00f,0.35f,0.35f,1.0f) },
-                            { "Offensive", &offTs,  ImVec4(1.00f,0.70f,0.10f,1.0f) },
-                            { "Defensive", &defTs,  ImVec4(0.30f,0.70f,1.00f,1.0f) },
-                            { "Mobility",  &mobTs,  ImVec4(0.40f,1.00f,0.40f,1.0f) },
-                            { "Utility",   &utilTs, ImVec4(0.90f,0.60f,1.00f,1.0f) },
-                        };
-                        for (auto& s : kSummary) {
-                            ImGui::TextColored(s.col, "%s", s.name);
-                            ImGui::Text("%d casts", (int)s.ts->size());
-                            ImGui::NextColumn();
-                        }
-                        ImGui::Columns(1);
-
-                        if (!unknownTs.empty()) {
-                            ImGui::Spacing();
-                            ImGui::TextDisabled(
-                                "(%d casts not matched to any spell list"
-                                " — check specData.h)",
-                                (int)unknownTs.size());
-                        }
-                    }
-
-                } catch (const json::exception& e) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                                       "JSON parse error: %s", e.what());
-                }
+            // Snapshot the shared strings under the mutex, then parse off it.
+            std::string rawSnap, bossSnap;
+            int         pidSnap;
+            {
+                std::lock_guard<std::mutex> dlock(g_debugMutex);
+                rawSnap  = g_debugRawResponse;
+                bossSnap = g_cachedBossJson;
+                pidSnap  = g_debugPlayerId;
             }
 
-            ImGui::End();
+            g_playerData      = BuildPlayerData(rawSnap, pidSnap, bossSnap);
+            g_playerDataReady = true;
         }
+
+        // ── Per-player detail window ──────────────────────────────────────────
+        if (g_debugWindowOpen)
+            RenderPlayerWindow(io, g_secondariesColormap);
 
         // ── Render ────────────────────────────────────────────────────────────
         ImGui::Render();

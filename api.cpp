@@ -118,7 +118,7 @@ std::string FetchReportData(const std::string& bearerToken,
     std::cout << "[WCL] FetchReportData query:\n" << query << "\n";
 
     std::string response = curlPost(API_URL, bearerToken, query);
-    std::cout << "[DEBUG]: FetchReportData() output:\n" << response << "\n";
+    //std::cout << "[DEBUG]: FetchReportData() output:\n" << response << "\n";
     return response;
 }
 
@@ -203,7 +203,7 @@ std::string fetchPersonalFightData(const Fight&       fight,
         }
     }
 
-    std::cout << "[DEBUG]: fetchPersonalFightData() output:\n" << result.dump() << "\n";
+    //std::cout << "[DEBUG]: fetchPersonalFightData() output:\n" << result.dump() << "\n";
     return result.dump();
 }
 
