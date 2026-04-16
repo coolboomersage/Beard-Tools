@@ -82,6 +82,64 @@ static const UpgradeTrack kUpgradeTracks[] = {
     { 12784, "Adv ?/6",     ImVec4(0.1f, 0.8f, 0.1f, 1.0f) },
 };
 
+//map to convert from WCL class / spec listings into the code equivilant
+static AllSpecs masterSpecList;
+struct SpecEntry { const char* cls; const char* spec; const WoWclass* wc; };
+const SpecEntry kSpecMap[] = {
+                        // Warrior
+                        { "Warrior",     "Arms",          &masterSpecList.armsWarrior        },
+                        { "Warrior",     "Fury",          &masterSpecList.furyWarrior        },
+                        { "Warrior",     "Protection",    &masterSpecList.protWarrior        },
+                        // Paladin
+                        { "Paladin",     "Holy",          &masterSpecList.holyPaladin        },
+                        { "Paladin",     "Protection",    &masterSpecList.protPaladin        },
+                        { "Paladin",     "Retribution",   &masterSpecList.retPaladin         },
+                        // Hunter
+                        { "Hunter",      "BeastMastery",  &masterSpecList.bmHunter           },
+                        { "Hunter",      "Marksmanship",  &masterSpecList.mmHunter           },
+                        { "Hunter",      "Survival",      &masterSpecList.survivalHunter     },
+                        // Rogue
+                        { "Rogue",       "Assassination", &masterSpecList.assassinationRogue },
+                        { "Rogue",       "Outlaw",        &masterSpecList.outlawRogue        },
+                        { "Rogue",       "Subtlety",      &masterSpecList.subtletyRogue      },
+                        // Priest
+                        { "Priest",      "Discipline",    &masterSpecList.discPriest         },
+                        { "Priest",      "Holy",          &masterSpecList.holyPriest         },
+                        { "Priest",      "Shadow",        &masterSpecList.shadowPriest       },
+                        // Death Knight
+                        { "DeathKnight", "Blood",         &masterSpecList.bloodDK            },
+                        { "DeathKnight", "Frost",         &masterSpecList.frostDK            },
+                        { "DeathKnight", "Unholy",        &masterSpecList.unholyDK           },
+                        // Shaman
+                        { "Shaman",      "Elemental",     &masterSpecList.elementalShaman    },
+                        { "Shaman",      "Enhancement",   &masterSpecList.enhancementShaman  },
+                        { "Shaman",      "Restoration",   &masterSpecList.restoShaman        },
+                        // Mage
+                        { "Mage",        "Arcane",        &masterSpecList.arcaneMage         },
+                        { "Mage",        "Fire",          &masterSpecList.fireMage           },
+                        { "Mage",        "Frost",         &masterSpecList.frostMage          },
+                        // Warlock
+                        { "Warlock",     "Affliction",    &masterSpecList.afflictionWarlock  },
+                        { "Warlock",     "Demonology",    &masterSpecList.demoWarlock        },
+                        { "Warlock",     "Destruction",   &masterSpecList.destroWarlock      },
+                        // Monk
+                        { "Monk",        "Brewmaster",    &masterSpecList.brewmasterMonk     },
+                        { "Monk",        "Mistweaver",    &masterSpecList.mistweaverMonk     },
+                        { "Monk",        "Windwalker",    &masterSpecList.windwalkerMonk     },
+                        // Druid
+                        { "Druid",       "Balance",       &masterSpecList.balanceDruid       },
+                        { "Druid",       "Feral",         &masterSpecList.feralDruid         },
+                        { "Druid",       "Guardian",      &masterSpecList.guardianDruid      },
+                        { "Druid",       "Restoration",   &masterSpecList.restoDruid         },
+                        // Demon Hunter
+                        { "DemonHunter", "Havoc",         &masterSpecList.havocDH            },
+                        { "DemonHunter", "Vengeance",     &masterSpecList.vengeanceDH        },
+                        // Evoker
+                        { "Evoker",      "Devastation",   &masterSpecList.devastationEvoker  },
+                        { "Evoker",      "Preservation",  &masterSpecList.preservationEvoker },
+                        { "Evoker",      "Augmentation",  &masterSpecList.augmentationEvoker },
+                    };
+
 // ---------------------------------------------------------------------------
 // Player entry — carries both the WCL numeric id and the display name so that
 // buttons can pass the id straight to fetchPersonalFightData().
@@ -487,6 +545,177 @@ std::string fetchPersonalFightData(const Fight&       fight,
     return result.dump();
 }
 
+std::string fetchBossCastTimeline(const Fight&       fight,
+                                  const std::string& reportCode,
+                                  const std::string& bearerToken)
+{
+    const std::string API_URL = "https://www.warcraftlogs.com/api/v2/client";
+    const std::string code    = jsonEscape(reportCode);
+
+    // ----------------------------------------------------------------
+    //  1. Resolve ALL boss sourceIDs + names from masterData actors
+    // ----------------------------------------------------------------
+    struct BossActor { int id; std::string name; };
+    std::vector<BossActor> bossActors;
+
+    {
+        std::string query =
+            "{\"query\":\"{ reportData { report(code: \\\"" + code + "\\\") {"
+            "  masterData {"
+            "    actors(type: \\\"NPC\\\") {"
+            "      id name subType"
+            "    }"
+            "  }"
+            "} } }\"}";
+
+        std::string response = curlPost(API_URL, bearerToken, query);
+
+        try
+        {
+            json j = json::parse(response);
+            const auto& actors = j["data"]["reportData"]["report"]["masterData"]["actors"];
+
+            for (const auto& actor : actors)
+            {
+                if (actor.value("subType", "") == "Boss")
+                {
+                    bossActors.push_back({
+                        actor["id"].get<int>(),
+                        actor.value("name", "Unknown Boss")
+                    });
+                }
+            }
+        }
+        catch (const json::exception& e)
+        {
+            std::cerr << "[WCL] masterData parse error: " << e.what() << "\n";
+            return "{}";
+        }
+
+        if (bossActors.empty())
+        {
+            std::cerr << "[WCL] Could not find any boss actors in masterData.\n";
+            return "{}";
+        }
+    }
+
+    // ----------------------------------------------------------------
+    //  2. Fetch ability names for human-readable output
+    // ----------------------------------------------------------------
+    json abilityMap = json::object();
+    {
+        std::string query =
+            "{\"query\":\"{ reportData { report(code: \\\"" + code + "\\\") {"
+            "  masterData {"
+            "    abilities { gameID name }"
+            "  }"
+            "} } }\"}";
+
+        std::string response = curlPost(API_URL, bearerToken, query);
+
+        try
+        {
+            json j = json::parse(response);
+            const auto& abilities = j["data"]["reportData"]["report"]["masterData"]["abilities"];
+            for (const auto& ab : abilities)
+                abilityMap[std::to_string(ab["gameID"].get<int>())] = ab["name"];
+        }
+        catch (const json::exception& e)
+        {
+            std::cerr << "[WCL] abilities parse error: " << e.what() << "\n";
+            // Non-fatal — names will fall back to "Unknown"
+        }
+    }
+
+    // ----------------------------------------------------------------
+    //  3. For each boss, page through all cast events
+    // ----------------------------------------------------------------
+    const std::string endStr = std::to_string(static_cast<long long>(fight.endTime));
+
+    // Flat list of all casts across all bosses, unsorted
+    json allEvents = json::array();
+
+    for (const auto& boss : bossActors)
+    {
+        const std::string sourceIDStr = std::to_string(boss.id);
+        long long pageStart = fight.startTime;
+        bool      morePages = true;
+
+        while (morePages)
+        {
+            const std::string pageStartStr = std::to_string(pageStart);
+
+            std::string query =
+                "{\"query\":\"{ reportData { report(code: \\\"" + code + "\\\") {"
+                "  events("
+                "    startTime: "     + pageStartStr + ","
+                "    endTime: "       + endStr       + ","
+                "    sourceID: "      + sourceIDStr  + ","
+                "    dataType: Casts,"
+                "    hostilityType: Enemies"
+                "  ) {"
+                "    data"
+                "    nextPageTimestamp"
+                "  }"
+                "} } }\"}";
+
+            std::string response = curlPost(API_URL, bearerToken, query);
+
+            try
+            {
+                json j          = json::parse(response);
+                auto& eventsObj = j["data"]["reportData"]["report"]["events"];
+
+                for (const auto& ev : eventsObj["data"])
+                {
+                    json entry;
+                    entry["timestamp"]    = ev.value("timestamp", 0LL);
+                    entry["abilityGameID"] = ev.value("abilityGameID", 0);
+                    entry["bossID"]       = boss.id;
+                    entry["bossName"]     = boss.name;
+
+                    std::string gameIDKey = std::to_string(ev.value("abilityGameID", 0));
+                    entry["abilityName"]  = abilityMap.value(gameIDKey, "Unknown");
+
+                    allEvents.push_back(entry);
+                }
+
+                if (eventsObj["nextPageTimestamp"].is_null())
+                    morePages = false;
+                else
+                    pageStart = eventsObj["nextPageTimestamp"].get<long long>();
+            }
+            catch (const json::exception& e)
+            {
+                std::cerr << "[WCL] events page parse error (bossID=" << boss.id << "): "
+                          << e.what() << "\n";
+                break;
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    //  4. Sort all events by timestamp ascending
+    // ----------------------------------------------------------------
+    std::sort(allEvents.begin(), allEvents.end(),
+              [](const json& a, const json& b) {
+                  return a.value("timestamp", 0LL) < b.value("timestamp", 0LL);
+              });
+
+    // ----------------------------------------------------------------
+    //  5. Build final result
+    // ----------------------------------------------------------------
+    json bossSummary = json::array();
+    for (const auto& boss : bossActors)
+        bossSummary.push_back({ {"id", boss.id}, {"name", boss.name} });
+
+    json result;
+    result["bosses"]      = bossSummary;
+    result["castTimeline"] = allEvents;
+
+    return result.dump(2);
+}
+
 // ---------------------------------------------------------------------------
 // Global state shared between the main thread and the background fetch thread
 // ---------------------------------------------------------------------------
@@ -500,6 +729,8 @@ static std::string           g_cachedReportCode;
 static std::string           g_cachedBearerToken;
 
 // Debug window for per-player data
+static Fight                 g_currentFight;
+static bool                  g_fetchedBossData = false;
 static std::mutex            g_debugMutex;
 static bool                  g_debugWindowOpen   = false;
 static std::atomic<bool>     g_debugFetching{ false };
@@ -508,7 +739,6 @@ static std::string           g_debugRawResponse;   // verbatim server JSON
 static int                   g_debugPlayerId = -1;
 
 int main(){
-    static AllSpecs masterSpecList;
     static std::string tokenResponse;
     static bool tokenFetched = false;
     static char wclUrlBuf[512] = "";
@@ -834,6 +1064,9 @@ int main(){
             {
                 bool fetching = g_debugFetching.load();
 
+                g_fetchedBossData = false;
+                g_currentFight = fight;
+
                 for (int i = 0; i < (int)players.size(); ++i) {
                     const PlayerEntry& pe = players[i];
 
@@ -964,7 +1197,7 @@ int main(){
                 ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
 
-            std::string windowTitle = "[DEBUG] " + g_debugWindowTitle;
+            std::string windowTitle = g_debugWindowTitle;
             ImGui::Begin(windowTitle.c_str(), &g_debugWindowOpen);
 
             if (g_debugFetching.load()) {
@@ -1278,62 +1511,6 @@ int main(){
                 // ── Resolve player's WoWclass from the composition strings ───────────────────
                 const WoWclass* pwc = nullptr;
                 {
-                    struct SpecEntry { const char* cls; const char* spec; const WoWclass* wc; };
-                    const SpecEntry kSpecMap[] = {
-                        // Warrior
-                        { "Warrior",     "Arms",          &masterSpecList.armsWarrior        },
-                        { "Warrior",     "Fury",          &masterSpecList.furyWarrior        },
-                        { "Warrior",     "Protection",    &masterSpecList.protWarrior        },
-                        // Paladin
-                        { "Paladin",     "Holy",          &masterSpecList.holyPaladin        },
-                        { "Paladin",     "Protection",    &masterSpecList.protPaladin        },
-                        { "Paladin",     "Retribution",   &masterSpecList.retPaladin         },
-                        // Hunter
-                        { "Hunter",      "BeastMastery",  &masterSpecList.bmHunter           },
-                        { "Hunter",      "Marksmanship",  &masterSpecList.mmHunter           },
-                        { "Hunter",      "Survival",      &masterSpecList.survivalHunter     },
-                        // Rogue
-                        { "Rogue",       "Assassination", &masterSpecList.assassinationRogue },
-                        { "Rogue",       "Outlaw",        &masterSpecList.outlawRogue        },
-                        { "Rogue",       "Subtlety",      &masterSpecList.subtletyRogue      },
-                        // Priest
-                        { "Priest",      "Discipline",    &masterSpecList.discPriest         },
-                        { "Priest",      "Holy",          &masterSpecList.holyPriest         },
-                        { "Priest",      "Shadow",        &masterSpecList.shadowPriest       },
-                        // Death Knight
-                        { "DeathKnight", "Blood",         &masterSpecList.bloodDK            },
-                        { "DeathKnight", "Frost",         &masterSpecList.frostDK            },
-                        { "DeathKnight", "Unholy",        &masterSpecList.unholyDK           },
-                        // Shaman
-                        { "Shaman",      "Elemental",     &masterSpecList.elementalShaman    },
-                        { "Shaman",      "Enhancement",   &masterSpecList.enhancementShaman  },
-                        { "Shaman",      "Restoration",   &masterSpecList.restoShaman        },
-                        // Mage
-                        { "Mage",        "Arcane",        &masterSpecList.arcaneMage         },
-                        { "Mage",        "Fire",          &masterSpecList.fireMage           },
-                        { "Mage",        "Frost",         &masterSpecList.frostMage          },
-                        // Warlock
-                        { "Warlock",     "Affliction",    &masterSpecList.afflictionWarlock  },
-                        { "Warlock",     "Demonology",    &masterSpecList.demoWarlock        },
-                        { "Warlock",     "Destruction",   &masterSpecList.destroWarlock      },
-                        // Monk
-                        { "Monk",        "Brewmaster",    &masterSpecList.brewmasterMonk     },
-                        { "Monk",        "Mistweaver",    &masterSpecList.mistweaverMonk     },
-                        { "Monk",        "Windwalker",    &masterSpecList.windwalkerMonk     },
-                        // Druid
-                        { "Druid",       "Balance",       &masterSpecList.balanceDruid       },
-                        { "Druid",       "Feral",         &masterSpecList.feralDruid         },
-                        { "Druid",       "Guardian",      &masterSpecList.guardianDruid      },
-                        { "Druid",       "Restoration",   &masterSpecList.restoDruid         },
-                        // Demon Hunter
-                        { "DemonHunter", "Havoc",         &masterSpecList.havocDH            },
-                        { "DemonHunter", "Vengeance",     &masterSpecList.vengeanceDH        },
-                        // Evoker
-                        { "Evoker",      "Devastation",   &masterSpecList.devastationEvoker  },
-                        { "Evoker",      "Preservation",  &masterSpecList.preservationEvoker },
-                        { "Evoker",      "Augmentation",  &masterSpecList.augmentationEvoker },
-                    };
-
                     for (auto& entry : kSpecMap) {
                         if (playerClass == entry.cls && playerSpec == entry.spec) {
                             pwc = entry.wc;
@@ -1351,7 +1528,6 @@ int main(){
                 }
                 else {
                     // ── Bucket timestamps by spell category ──────────────────────────────────
-                    // Build O(1) lookup sets from the hardcoded spell lists.
                     auto makeSet = [](const std::vector<int>& v) {
                         std::unordered_set<int> s(v.begin(), v.end());
                         return s;
@@ -1364,64 +1540,171 @@ int main(){
 
                     std::vector<double> rotTs, offTs, defTs, mobTs, utilTs, unknownTs;
 
-                    double t0 = -1.0;
+                    double t0 = -1.0, tMax = 0.0;
                     for (const auto& ev : root["events"]) {
-                        // Only the selected player's own casts — skip pets, NPCs, other players.
                         if (!ev.contains("sourceID")) continue;
                         if (ev["sourceID"].get<int>() != g_debugPlayerId) continue;
-
-                        // Skip auto-attacks and WCL synthetic "fake" events.
                         if (ev.value("melee", false)) continue;
                         if (ev.value("fake",  false)) continue;
 
-                        const int  sid = ev.value("abilityGameID", 0);
-                        const double ts = ev.value("timestamp", 0.0);
-                        if (sid == 0 || sid == 1) continue;  // melee / null spells
+                        const int    sid = ev.value("abilityGameID", 0);
+                        const double ts  = ev.value("timestamp", 0.0);
+                        if (sid == 0 || sid == 1) continue;
 
                         if (t0 < 0.0) t0 = ts;
-                        const double t = (ts - t0) / 1000.0;   // → seconds from first event
+                        const double t = (ts - t0) / 1000.0;
+                        tMax = std::max(tMax, t);
 
                         if      (rotSet.count(sid))   rotTs.push_back(t);
                         else if (offSet.count(sid))   offTs.push_back(t);
                         else if (defSet.count(sid))   defTs.push_back(t);
                         else if (mobSet.count(sid))   mobTs.push_back(t);
                         else if (utilSet.count(sid))  utilTs.push_back(t);
-                        else                          unknownTs.push_back(t);  // cast by player but not in any list
+                        else                          unknownTs.push_back(t);
                     }
 
-                    // ── Multi-row scatter timeline (one horizontal track per category) ─────────
-                    //   Row Y values:   4 = Rotation, 3 = Offensive, 2 = Defensive,
-                    //                   1 = Mobility, 0 = Utility
-                    static const double kYTicks[]  = { 0.0, 1.0, 2.0, 3.0, 4.0 };
-                    static const char*  kYLabels[] = { "Utility", "Mobility", "Defensive", "Offensive", "Rotation" };
+                    // ── Fetch boss cast timeline ──────────────────────────────────────────────
+                    // Boss rows are appended below the 5 player rows.
+                    // Each boss gets a label row (no markers) and an ability row.
+                    // Row layout (bottom-up):
+                    //   0 = Utility, 1 = Mobility, 2 = Defensive, 3 = Offensive, 4 = Rotation
+                    //   5 = [gap]
+                    //   6 = Boss 0 casts, 7 = Boss 1 casts, ...  (interleaved with label ticks)
+                    //
+                    // We parse the boss JSON once and store per-boss timestamp vectors.
+                    struct BossRow {
+                        std::string         name;
+                        std::vector<double> ts;
+                    };
+                    std::vector<BossRow> bossRows;
 
-                    if (ImPlot::BeginPlot("##CastTimeline", ImVec2(-1, 200),
-                                        ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend))
+                    {
+                        std::string bossJson;
+                        if (!g_fetchedBossData) {bossJson = fetchBossCastTimeline(g_currentFight , g_cachedReportCode, g_cachedBearerToken);}
+                        g_fetchedBossData = true;
+
+                        try {
+                            json bj = json::parse(bossJson);
+                            // Build a per-boss map first so we preserve boss order.
+                            std::vector<std::string> bossOrder;
+                            std::unordered_map<std::string, BossRow> bossMap;
+
+                            if (bj.contains("bosses")) {
+                                for (const auto& b : bj["bosses"]) {
+                                    std::string name = b.value("name", "Unknown");
+                                    if (bossMap.find(name) == bossMap.end()) {
+                                        bossOrder.push_back(name);
+                                        bossMap[name].name = name;
+                                    }
+                                }
+                            }
+
+                            if (bj.contains("castTimeline")) {
+                                for (const auto& ev : bj["castTimeline"]) {
+                                    std::string name = ev.value("bossName", "Unknown");
+                                    double ts = ev.value("timestamp", 0.0);
+                                    // Normalise to the same t0 as the player events.
+                                    double t = (t0 >= 0.0) ? (ts - t0) / 1000.0 : ts / 1000.0;
+                                    tMax = std::max(tMax, t);
+                                    if (bossMap.find(name) != bossMap.end())
+                                        bossMap[name].ts.push_back(t);
+                                }
+                            }
+
+                            for (const auto& name : bossOrder)
+                                bossRows.push_back(std::move(bossMap[name]));
+                        }
+                        catch (const std::exception& e) {
+                            std::cerr << "[Timeline] boss JSON parse error: " << e.what() << "\n";
+                        }
+                    }
+
+                    // ── Build unified Y-axis ticks ────────────────────────────────────────────
+                    // Player rows: Y = 0..4  (Utility → Rotation)
+                    // Gap at Y = 5 (visual breathing room, no label)
+                    // Boss rows start at Y = 6, each boss occupies one Y slot.
+                    // A thin separator label "── BossName ──" sits at that Y value; the
+                    // actual cast markers are plotted at the same Y (circles sit on the label).
+                    const int kPlayerRows = 5;
+                    const int kGap        = 1;          // one empty tick between player and boss
+                    const int kBossBase   = kPlayerRows + kGap;   // = 6
+
+                    const int totalRows = kBossBase + static_cast<int>(bossRows.size());
+                    // Y limits: player rows 0..4, gap at 5, boss rows 6..N
+                    const double yMin = -0.6;
+                    const double yMax = static_cast<double>(totalRows) - 0.4;
+
+                    std::vector<double>      yTickVals;
+                    std::vector<const char*> yTickLabels;
+                    // Static storage for boss name strings (must outlive the plot call).
+                    std::vector<std::string> bossLabelStorage;
+
+                    // Player ticks
+                    static const double     kPlayerY[]      = { 0.0, 1.0, 2.0, 3.0, 4.0 };
+                    static const char*      kPlayerLabels[] = { "Utility", "Mobility", "Defensive", "Offensive", "Rotation" };
+                    for (int i = 0; i < kPlayerRows; ++i) {
+                        yTickVals.push_back(kPlayerY[i]);
+                        yTickLabels.push_back(kPlayerLabels[i]);
+                    }
+
+                    // Gap tick (empty label keeps the axis clean)
+                    yTickVals.push_back(static_cast<double>(kPlayerRows));
+                    yTickLabels.push_back("");
+
+                    // Boss ticks
+                    bossLabelStorage.reserve(bossRows.size());
+                    for (int i = 0; i < static_cast<int>(bossRows.size()); ++i) {
+                        bossLabelStorage.push_back(bossRows[i].name);
+                        yTickVals.push_back(static_cast<double>(kBossBase + i));
+                        yTickLabels.push_back(bossLabelStorage.back().c_str());
+                    }
+
+                    // ── Plot height scales with number of rows ────────────────────────────────
+                    const float rowPx      = 28.0f;
+                    const float plotHeight = rowPx * static_cast<float>(totalRows);
+
+                    // ── Multi-row scatter timeline ────────────────────────────────────────────
+                    if (ImPlot::BeginPlot("##CastTimeline", ImVec2(-1, plotHeight),
+                                          ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend))
                     {
                         ImPlot::SetupAxes("Time (s)", nullptr,
-                                        ImPlotAxisFlags_None,
-                                        ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_NoTickMarks);
-                        ImPlot::SetupAxisTicks(ImAxis_Y1, kYTicks, 5, kYLabels);
-                        // Lock Y so rows never shift; X auto-fits to the fight duration.
-                        ImPlot::SetupAxisLimits(ImAxis_Y1, -0.6, 4.6, ImGuiCond_Always);
+                                          ImPlotAxisFlags_None,
+                                          ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_NoTickMarks);
 
-                        // Each category is its own PlotScatter call so colours are independent.
+                        ImPlot::SetupAxisTicks(ImAxis_Y1,
+                                               yTickVals.data(),
+                                               static_cast<int>(yTickVals.size()),
+                                               yTickLabels.data());
+
+                        // Lock both axes — no scrolling, no zooming.
+                        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, tMax > 0.0 ? tMax * 1.05 : 60.0, ImGuiCond_Always);
+                        ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImGuiCond_Always);
+
                         auto plotRow = [](const std::vector<double>& ts,
-                                        double                      rowY,
-                                        ImVec4                      col,
-                                        const char*                 id)
+                                          double                      rowY,
+                                          ImVec4                      col,
+                                          const char*                 id)
                         {
                             if (ts.empty()) return;
                             std::vector<double> ys(ts.size(), rowY);
-                            //ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 5.0f, col, 1.0f, col);
                             ImPlot::PlotScatter(id, ts.data(), ys.data(), static_cast<int>(ts.size()));
                         };
 
-                        plotRow(rotTs,  4.0, ImVec4(1.00f, 0.35f, 0.35f, 1.0f), "##rot");   // red
-                        plotRow(offTs,  3.0, ImVec4(1.00f, 0.70f, 0.10f, 1.0f), "##off");   // orange
-                        plotRow(defTs,  2.0, ImVec4(0.30f, 0.70f, 1.00f, 1.0f), "##def");   // blue
-                        plotRow(mobTs,  1.0, ImVec4(0.40f, 1.00f, 0.40f, 1.0f), "##mob");   // green
-                        plotRow(utilTs, 0.0, ImVec4(0.90f, 0.60f, 1.00f, 1.0f), "##util");  // purple
+                        // Player rows
+                        plotRow(rotTs,  4.0, ImVec4(1.00f, 0.35f, 0.35f, 1.0f), "##rot");
+                        plotRow(offTs,  3.0, ImVec4(1.00f, 0.70f, 0.10f, 1.0f), "##off");
+                        plotRow(defTs,  2.0, ImVec4(0.30f, 0.70f, 1.00f, 1.0f), "##def");
+                        plotRow(mobTs,  1.0, ImVec4(0.40f, 1.00f, 0.40f, 1.0f), "##mob");
+                        plotRow(utilTs, 0.0, ImVec4(0.90f, 0.60f, 1.00f, 1.0f), "##util");
+
+                        // Boss rows — one scatter series per boss, dim gold colour.
+                        for (int i = 0; i < static_cast<int>(bossRows.size()); ++i) {
+                            std::string id = "##boss" + std::to_string(i);
+                            plotRow(bossRows[i].ts,
+                                    static_cast<double>(kBossBase + i),
+                                    ImVec4(1.00f, 0.85f, 0.20f, 0.85f),   // gold
+                                    id.c_str());
+                        }
 
                         ImPlot::EndPlot();
                     }
@@ -1445,7 +1728,7 @@ int main(){
                     }
                     ImGui::Columns(1);
 
-                    // ── Unmatched-cast disclosure (aids debugging missing spell IDs) ──────────
+                    // ── Unmatched-cast disclosure ─────────────────────────────────────────────
                     if (!unknownTs.empty()) {
                         ImGui::Spacing();
                         ImGui::TextDisabled("(%d casts not matched to any spell list — check specData.h)",
