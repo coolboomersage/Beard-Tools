@@ -60,7 +60,18 @@ set(IMPLOT_SOURCES
 )
 
 # ----------------------- exe file -------------------------------------
-add_executable(BeardTools main.cpp ${IMGUI_SOURCES} ${IMPLOT_SOURCES})
+add_executable(BeardTools 
+    main.cpp
+    api.cpp
+    api.h
+    globals.cpp
+    globals.h
+    types.h
+    utils.cpp
+    utils.h 
+    ${IMGUI_SOURCES} 
+    ${IMPLOT_SOURCES}
+)
 
 target_include_directories(BeardTools PRIVATE
     ${IMPLOT_DIR}
